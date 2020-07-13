@@ -17,18 +17,15 @@ import (
 	"bytes"
 	"compress/flate"
 	"crypto/sha1"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -98,13 +95,9 @@ type websocket struct {
 
 type srvWebsocket struct {
 	mu             sync.RWMutex
-	server         *http.Server
-	listener       net.Listener
-	tls            bool
+	mux            *http.ServeMux
 	allowedOrigins map[string]*allowedOrigin // host will be the key
 	sameOrigin     bool
-	connectURLs    []string
-	connectURLsMap map[string]struct{}
 	users          map[string]*User
 	nkeys          map[string]*NkeyUser
 	authOverride   bool // indicate if there is auth override in websocket config
@@ -730,14 +723,6 @@ func wsAcceptKey(key string) string {
 // Validate the websocket related options.
 func validateWebsocketOptions(o *Options) error {
 	wo := &o.Websocket
-	// If no port is defined, we don't care about other options
-	if wo.Port == 0 {
-		return nil
-	}
-	// Enforce TLS...
-	if !testWebsocketAllowNonTLS && wo.TLSConfig == nil {
-		return errors.New("websocket requires TLS configuration")
-	}
 	// Make sure that allowed origins, if specified, can be parsed.
 	for _, ao := range wo.AllowedOrigins {
 		if _, err := url.Parse(ao); err != nil {
@@ -820,15 +805,9 @@ func (s *Server) startWebsocketServer() {
 
 	s.wsSetOriginOptions(o)
 
-	var hl net.Listener
-	var proto string
+	// var hl net.Listener
+	// var proto string
 	var err error
-
-	port := o.Port
-	if port == -1 {
-		port = 0
-	}
-	hp := net.JoinHostPort(o.Host, strconv.Itoa(port))
 
 	// We are enforcing (when validating the options) the use of TLS, but the
 	// code was originally supporting both modes. The reason for TLS only is
@@ -840,32 +819,13 @@ func (s *Server) startWebsocketServer() {
 		s.mu.Unlock()
 		return
 	}
-	if o.TLSConfig != nil {
-		proto = "wss"
-		config := o.TLSConfig.Clone()
-		hl, err = tls.Listen("tcp", hp, config)
-	} else {
-		proto = "ws"
-		hl, err = net.Listen("tcp", hp)
-	}
 	if err != nil {
 		s.mu.Unlock()
 		s.Fatalf("Unable to listen for websocket connections: %v", err)
 		return
 	}
-	s.Noticef("Listening for websocket clients on %s://%s:%d", proto, o.Host, port)
+	s.Noticef("Listening for websocket clients on internal mux")
 
-	s.websocket.tls = proto == "wss"
-	if port == 0 {
-		s.opts.Websocket.Port = hl.Addr().(*net.TCPAddr).Port
-	}
-	s.websocket.connectURLs, err = s.getConnectURLs(o.Advertise, o.Host, o.Port)
-	if err != nil {
-		s.Fatalf("Unable to get websocket connect URLs: %v", err)
-		hl.Close()
-		s.mu.Unlock()
-		return
-	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		res, err := s.wsUpgrade(w, r)
@@ -875,27 +835,7 @@ func (s *Server) startWebsocketServer() {
 		}
 		s.createClient(res.conn, res.ws)
 	})
-	hs := &http.Server{
-		Addr:        hp,
-		Handler:     mux,
-		ReadTimeout: o.HandshakeTimeout,
-		ErrorLog:    log.New(&wsCaptureHTTPServerLog{s}, "", 0),
-	}
-	s.websocket.server = hs
-	s.websocket.listener = hl
-	go func() {
-		if err := hs.Serve(hl); err != http.ErrServerClosed {
-			s.Fatalf("websocket listener error: %v", err)
-		}
-		if s.isLameDuckMode() {
-			// Signal that we are not accepting new clients
-			s.ldmCh <- true
-			// Now wait for the Shutdown...
-			<-s.quitCh
-			return
-		}
-		s.done <- true
-	}()
+	s.websocket.mux = mux
 	s.mu.Unlock()
 }
 

@@ -1851,12 +1851,7 @@ func (c *client) sendPing() {
 // Assume lock is held.
 func (c *client) generateClientInfoJSON(info Info) []byte {
 	info.CID = c.cid
-	info.ClientIP = c.host
 	info.MaxPayload = c.mpay
-	if c.ws != nil {
-		info.ClientConnectURLs = info.WSConnectURLs
-	}
-	info.WSConnectURLs = nil
 	// Generate the info json
 	b, _ := json.Marshal(info)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
@@ -4013,8 +4008,6 @@ func (c *client) teardownConn() {
 
 	var (
 		retryImplicit bool
-		connectURLs   []string
-		wsConnectURLs []string
 		gwName        string
 		gwIsOutbound  bool
 		gwCfg         *gatewayCfg
@@ -4043,8 +4036,6 @@ func (c *client) teardownConn() {
 		if !noReconnect {
 			retryImplicit = c.route.retry
 		}
-		connectURLs = c.route.connectURLs
-		wsConnectURLs = c.route.wsConnURLs
 	}
 	if kind == GATEWAY {
 		gwName = c.gw.name
@@ -4068,13 +4059,6 @@ func (c *client) teardownConn() {
 	}
 
 	if srv != nil {
-		// If this is a route that disconnected, possibly send an INFO with
-		// the updated list of connect URLs to clients that know how to
-		// handle async INFOs.
-		if (len(connectURLs) > 0 || len(wsConnectURLs) > 0) && !srv.getOpts().Cluster.NoAdvertise {
-			srv.removeConnectURLsAndSendINFOToClients(connectURLs, wsConnectURLs)
-		}
-
 		// Unregister
 		srv.removeClient(c)
 
@@ -4127,7 +4111,6 @@ func (c *client) teardownConn() {
 		c.mu.Lock()
 		rid := c.route.remoteID
 		rtype := c.route.routeType
-		rurl := c.route.url
 		c.mu.Unlock()
 
 		srv.mu.Lock()
@@ -4143,13 +4126,13 @@ func (c *client) teardownConn() {
 			srv.Debugf("Not attempting reconnect for solicited route, already connected to \"%s\"", rid)
 			return
 		} else if rid == srv.info.ID {
-			srv.Debugf("Detected route to self, ignoring \"%s\"", rurl)
+			srv.Debugf("Detected route to self, ignoring")
 			return
 		} else if rtype != Implicit || retryImplicit {
-			srv.Debugf("Attempting reconnect for solicited route \"%s\"", rurl)
+			srv.Debugf("Attempting reconnect for solicited route")
 			// Keep track of this go-routine so we can wait for it on
 			// server shutdown.
-			srv.startGoRoutine(func() { srv.reConnectToRoute(rurl, rtype) })
+			srv.startGoRoutine(func() { srv.reConnectToRoute(rid, rtype) })
 		}
 	} else if srv != nil && kind == GATEWAY && gwIsOutbound {
 		if gwCfg != nil {

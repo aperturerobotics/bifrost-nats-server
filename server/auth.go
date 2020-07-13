@@ -166,7 +166,7 @@ func (s *Server) checkAuthforWarnings() {
 	for _, u := range s.users {
 		// Skip warn if using TLS certs based auth
 		// unless a password has been left in the config.
-		if u.Password == "" && s.opts.TLSMap {
+		if u.Password == "" { // && s.opts.TLSMap {
 			continue
 		}
 
@@ -358,11 +358,8 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 		users      map[string]*User
 		nkusers    map[string]*NkeyUser
 	)
-	tlsMap := opts.TLSMap
 	if c.ws != nil {
 		wo := &opts.Websocket
-		// Always override TLSMap.
-		tlsMap = wo.TLSMap
 		// The rest depends on if there was any auth override in
 		// the websocket's config.
 		if s.websocket.authOverride {
@@ -374,8 +371,6 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 			nkusers = s.websocket.nkeys
 			ao = true
 		}
-	} else if c.kind == LEAF {
-		tlsMap = opts.LeafNode.TLSMap
 	}
 	if !ao {
 		noAuthUser = opts.NoAuthUser
@@ -420,41 +415,17 @@ func (s *Server) processClientOrLeafAuthentication(c *client, opts *Options) boo
 		}
 	} else if hasUsers {
 		// Check if we are tls verify and are mapping users from the client_certificate
-		if tlsMap {
-			var euser string
-			authorized := checkClientTLSCertSubject(c, func(u string) bool {
-				var ok bool
-				user, ok = users[u]
-				if !ok {
-					c.Debugf("User in cert [%q], not found", u)
-					return false
-				}
-				euser = u
-				return true
-			})
-			if !authorized {
+		if c.kind == CLIENT && c.opts.Username == "" && noAuthUser != "" {
+			if u, exists := users[noAuthUser]; exists {
+				c.opts.Username = u.Username
+				c.opts.Password = u.Password
+			}
+		}
+		if c.opts.Username != "" {
+			user, ok = users[c.opts.Username]
+			if !ok {
 				s.mu.Unlock()
 				return false
-			}
-			if c.opts.Username != "" {
-				s.Warnf("User %q found in connect proto, but user required from cert", c.opts.Username)
-			}
-			// Already checked that the client didn't send a user in connect
-			// but we set it here to be able to identify it in the logs.
-			c.opts.Username = euser
-		} else {
-			if c.kind == CLIENT && c.opts.Username == "" && noAuthUser != "" {
-				if u, exists := users[noAuthUser]; exists {
-					c.opts.Username = u.Username
-					c.opts.Password = u.Password
-				}
-			}
-			if c.opts.Username != "" {
-				user, ok = users[c.opts.Username]
-				if !ok {
-					s.mu.Unlock()
-					return false
-				}
 			}
 		}
 	}
@@ -697,12 +668,6 @@ func (s *Server) isRouterAuthorized(c *client) bool {
 		return true
 	}
 
-	if opts.Cluster.TLSMap {
-		return checkClientTLSCertSubject(c, func(user string) bool {
-			return opts.Cluster.Username == user
-		})
-	}
-
 	if opts.Cluster.Username != c.opts.Username {
 		return false
 	}
@@ -721,12 +686,6 @@ func (s *Server) isGatewayAuthorized(c *client) bool {
 	}
 
 	// Check whether TLS map is enabled, otherwise use single user/pass.
-	if opts.Gateway.TLSMap {
-		return checkClientTLSCertSubject(c, func(user string) bool {
-			return opts.Gateway.Username == user
-		})
-	}
-
 	if opts.Gateway.Username != c.opts.Username {
 		return false
 	}
@@ -770,30 +729,6 @@ func (s *Server) isLeafNodeAuthorized(c *client) bool {
 	if opts.LeafNode.Username != _EMPTY_ {
 		return isAuthorized(opts.LeafNode.Username, opts.LeafNode.Password, opts.LeafNode.Account)
 	} else if len(opts.LeafNode.Users) > 0 {
-		if opts.LeafNode.TLSMap {
-			var user *User
-			found := checkClientTLSCertSubject(c, func(u string) bool {
-				// This is expected to be a very small array.
-				for _, usr := range opts.LeafNode.Users {
-					if u == usr.Username {
-						user = usr
-						return true
-					}
-				}
-				c.Debugf("User in cert [%q], not found", u)
-				return false
-			})
-			if !found {
-				return false
-			}
-			if c.opts.Username != "" {
-				s.Warnf("User %q found in connect proto, but user required from cert", c.opts.Username)
-			}
-			c.opts.Username = user.Username
-			// This will authorize since are using an existing user,
-			// but it will also register with proper account.
-			return isAuthorized(user.Username, user.Password, user.Account.GetName())
-		}
 
 		// This is expected to be a very small array.
 		for _, u := range opts.LeafNode.Users {

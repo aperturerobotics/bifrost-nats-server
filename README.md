@@ -10,6 +10,8 @@ This is the Aperture Robotics fork which adds a minimal patchset exposing the
 inner server constructors to outside api consumers, so that we can construct the
 server with a keypair created outside of Nats.
 
+This version keeps the server as a library rather than a daemon.
+
 ## License
 
 Unless otherwise noted, the NATS source files are distributed

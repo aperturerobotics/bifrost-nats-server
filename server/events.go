@@ -238,7 +238,6 @@ RESET:
 	sysacc := s.sys.account
 	sendq := s.sys.sendq
 	id := s.info.ID
-	host := s.info.Host
 	servername := s.info.Name
 	seqp := &s.sys.seq
 	js := s.js != nil
@@ -264,7 +263,6 @@ RESET:
 		case pm := <-sendq:
 			if pm.si != nil {
 				pm.si.Name = servername
-				pm.si.Host = host
 				pm.si.Cluster = cluster
 				pm.si.ID = id
 				pm.si.Seq = atomic.AddUint64(seqp, 1)
@@ -851,9 +849,6 @@ func (s *Server) filterRequest(msg []byte) (bool, error) {
 		return false, err
 	}
 	if fOpts.Name != "" && !strings.Contains(s.info.Name, fOpts.Name) {
-		return true, nil
-	}
-	if fOpts.Host != "" && !strings.Contains(s.info.Host, fOpts.Host) {
 		return true, nil
 	}
 	if fOpts.Cluster != "" {

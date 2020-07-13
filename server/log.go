@@ -15,10 +15,10 @@ package server
 
 import (
 	"io"
-	"os"
 	"sync/atomic"
 
 	srvlog "github.com/nats-io/nats-server/v2/logger"
+	"github.com/sirupsen/logrus"
 )
 
 // Logger interface of the NATS Server
@@ -52,39 +52,17 @@ func (s *Server) ConfigureLogger() {
 		opts = s.getOpts()
 	)
 
-	if opts.NoLog {
-		return
+	var le *logrus.Entry
+	if s.opts.Logger != nil {
+		le = s.opts.Logger
+	}
+	if le == nil {
+		llog := logrus.New()
+		llog.SetLevel(logrus.DebugLevel)
+		le = logrus.NewEntry(llog)
 	}
 
-	syslog := opts.Syslog
-	if isWindowsService() && opts.LogFile == "" {
-		// Enable syslog if no log file is specified and we're running as a
-		// Windows service so that logs are written to the Windows event log.
-		syslog = true
-	}
-
-	if opts.LogFile != "" {
-		log = srvlog.NewFileLogger(opts.LogFile, opts.Logtime, opts.Debug, opts.Trace, true)
-		if opts.LogSizeLimit > 0 {
-			if l, ok := log.(*srvlog.Logger); ok {
-				l.SetSizeLimit(opts.LogSizeLimit)
-			}
-		}
-	} else if opts.RemoteSyslog != "" {
-		log = srvlog.NewRemoteSysLogger(opts.RemoteSyslog, opts.Debug, opts.Trace)
-	} else if syslog {
-		log = srvlog.NewSysLogger(opts.Debug, opts.Trace)
-	} else {
-		colors := true
-		// Check to see if stderr is being redirected and if so turn off color
-		// Also turn off colors if we're running on Windows where os.Stderr.Stat() returns an invalid handle-error
-		stat, err := os.Stderr.Stat()
-		if err != nil || (stat.Mode()&os.ModeCharDevice) == 0 {
-			colors = false
-		}
-		log = srvlog.NewStdLogger(opts.Logtime, opts.Debug, opts.Trace, colors, true)
-	}
-
+	log = srvlog.NewLogger(le, opts.Debug, opts.Trace, true)
 	s.SetLoggerV2(log, opts.Debug, opts.Trace, opts.TraceVerbose)
 }
 
@@ -140,19 +118,7 @@ func (s *Server) ReOpenLogFile() {
 	}
 
 	// Snapshot server options.
-	opts := s.getOpts()
-
-	if opts.LogFile == "" {
-		s.Noticef("File log re-open ignored, not a file logger")
-	} else {
-		fileLog := srvlog.NewFileLogger(opts.LogFile,
-			opts.Logtime, opts.Debug, opts.Trace, true)
-		s.SetLogger(fileLog, opts.Debug, opts.Trace)
-		if opts.LogSizeLimit > 0 {
-			fileLog.SetSizeLimit(opts.LogSizeLimit)
-		}
-		s.Noticef("File log re-opened")
-	}
+	// opts := s.getOpts()
 }
 
 // Noticef logs a notice statement
