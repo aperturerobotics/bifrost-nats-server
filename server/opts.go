@@ -14,11 +14,7 @@
 package server
 
 import (
-	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"errors"
-	"flag"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -34,7 +30,7 @@ import (
 	"time"
 
 	"github.com/nats-io/jwt/v2"
-	"github.com/nats-io/nkeys"
+	"github.com/sirupsen/logrus"
 
 	"github.com/nats-io/nats-server/v2/conf"
 )
@@ -58,18 +54,10 @@ func NoErrOnUnknownFields(noError bool) {
 // and json tags are deprecated and may be removed in the future.
 type ClusterOpts struct {
 	Name           string            `json:"-"`
-	Host           string            `json:"addr,omitempty"`
-	Port           int               `json:"cluster_port,omitempty"`
 	Username       string            `json:"-"`
 	Password       string            `json:"-"`
 	AuthTimeout    float64           `json:"auth_timeout,omitempty"`
 	Permissions    *RoutePermissions `json:"-"`
-	TLSTimeout     float64           `json:"-"`
-	TLSConfig      *tls.Config       `json:"-"`
-	TLSMap         bool              `json:"-"`
-	ListenStr      string            `json:"-"`
-	Advertise      string            `json:"-"`
-	NoAdvertise    bool              `json:"-"`
 	ConnectRetries int               `json:"-"`
 }
 
@@ -78,21 +66,14 @@ type ClusterOpts struct {
 // and json tags are deprecated and may be removed in the future.
 type GatewayOpts struct {
 	Name           string               `json:"name"`
-	Host           string               `json:"addr,omitempty"`
-	Port           int                  `json:"port,omitempty"`
 	Username       string               `json:"-"`
 	Password       string               `json:"-"`
 	AuthTimeout    float64              `json:"auth_timeout,omitempty"`
-	TLSConfig      *tls.Config          `json:"-"`
-	TLSTimeout     float64              `json:"tls_timeout,omitempty"`
-	TLSMap         bool                 `json:"-"`
-	Advertise      string               `json:"advertise,omitempty"`
 	ConnectRetries int                  `json:"connect_retries,omitempty"`
 	Gateways       []*RemoteGatewayOpts `json:"gateways,omitempty"`
 	RejectUnknown  bool                 `json:"reject_unknown,omitempty"`
 
 	// Not exported, for tests.
-	resolver         netResolver
 	sendQSubsBufSize int
 }
 
@@ -100,48 +81,35 @@ type GatewayOpts struct {
 // NOTE: This structure is no longer used for monitoring endpoints
 // and json tags are deprecated and may be removed in the future.
 type RemoteGatewayOpts struct {
-	Name       string      `json:"name"`
-	TLSConfig  *tls.Config `json:"-"`
-	TLSTimeout float64     `json:"tls_timeout,omitempty"`
-	URLs       []*url.URL  `json:"urls,omitempty"`
+	Name string `json:"name"`
 }
 
 // LeafNodeOpts are options for a given server to accept leaf node connections and/or connect to a remote cluster.
 type LeafNodeOpts struct {
-	Host              string        `json:"addr,omitempty"`
-	Port              int           `json:"port,omitempty"`
+	Name              string        `json:"name,omitempty"`
 	Username          string        `json:"-"`
 	Password          string        `json:"-"`
 	Account           string        `json:"-"`
 	Users             []*User       `json:"-"`
 	AuthTimeout       float64       `json:"auth_timeout,omitempty"`
-	TLSConfig         *tls.Config   `json:"-"`
-	TLSTimeout        float64       `json:"tls_timeout,omitempty"`
-	TLSMap            bool          `json:"-"`
-	Advertise         string        `json:"-"`
-	NoAdvertise       bool          `json:"-"`
 	ReconnectInterval time.Duration `json:"-"`
 
 	// For solicited connections to other clusters/superclusters.
 	Remotes []*RemoteLeafOpts `json:"remotes,omitempty"`
 
 	// Not exported, for tests.
-	resolver    netResolver
 	dialTimeout time.Duration
 	connDelay   time.Duration
 }
 
 // RemoteLeafOpts are options for connecting to a remote server as a leaf node.
 type RemoteLeafOpts struct {
-	LocalAccount string      `json:"local_account,omitempty"`
-	URLs         []*url.URL  `json:"urls,omitempty"`
-	Credentials  string      `json:"-"`
-	TLS          bool        `json:"-"`
-	TLSConfig    *tls.Config `json:"-"`
-	TLSTimeout   float64     `json:"tls_timeout,omitempty"`
-	Hub          bool        `json:"hub,omitempty"`
-	DenyImports  []string    `json:"-"`
-	DenyExports  []string    `json:"-"`
+	Name         string   `json:"name,omitempty"`
+	LocalAccount string   `json:"local_account,omitempty"`
+	Credentials  string   `json:"-"`
+	Hub          bool     `json:"hub,omitempty"`
+	DenyImports  []string `json:"-"`
+	DenyExports  []string `json:"-"`
 }
 
 // Options block for nats-server.
@@ -150,9 +118,6 @@ type RemoteLeafOpts struct {
 type Options struct {
 	ConfigFile            string        `json:"-"`
 	ServerName            string        `json:"server_name"`
-	Host                  string        `json:"addr"`
-	Port                  int           `json:"port"`
-	ClientAdvertise       string        `json:"-"`
 	Trace                 bool          `json:"-"`
 	Debug                 bool          `json:"-"`
 	TraceVerbose          bool          `json:"-"`
@@ -176,10 +141,7 @@ type Options struct {
 	Authorization         string        `json:"-"`
 	PingInterval          time.Duration `json:"ping_interval"`
 	MaxPingsOut           int           `json:"ping_max"`
-	HTTPHost              string        `json:"http_host"`
-	HTTPPort              int           `json:"http_port"`
 	HTTPBasePath          string        `json:"http_base_path"`
-	HTTPSPort             int           `json:"https_port"`
 	AuthTimeout           float64       `json:"auth_timeout"`
 	MaxControlLine        int32         `json:"max_control_line"`
 	MaxPayload            int32         `json:"max_payload"`
@@ -191,25 +153,6 @@ type Options struct {
 	JetStreamMaxMemory    int64         `json:"-"`
 	JetStreamMaxStore     int64         `json:"-"`
 	StoreDir              string        `json:"-"`
-	Websocket             WebsocketOpts `json:"-"`
-	ProfPort              int           `json:"-"`
-	PidFile               string        `json:"-"`
-	PortsFileDir          string        `json:"-"`
-	LogFile               string        `json:"-"`
-	LogSizeLimit          int64         `json:"-"`
-	Syslog                bool          `json:"-"`
-	RemoteSyslog          string        `json:"-"`
-	Routes                []*url.URL    `json:"-"`
-	RoutesStr             string        `json:"-"`
-	TLSTimeout            float64       `json:"tls_timeout"`
-	TLS                   bool          `json:"-"`
-	TLSVerify             bool          `json:"-"`
-	TLSMap                bool          `json:"-"`
-	TLSCert               string        `json:"-"`
-	TLSKey                string        `json:"-"`
-	TLSCaCert             string        `json:"-"`
-	TLSConfig             *tls.Config   `json:"-"`
-	AllowNonTLS           bool          `json:"-"`
 	WriteDeadline         time.Duration `json:"-"`
 	MaxClosedClients      int           `json:"-"`
 	LameDuckDuration      time.Duration `json:"-"`
@@ -219,17 +162,19 @@ type Options struct {
 	MaxTracedMsgLen int `json:"-"`
 
 	// Operating a trusted NATS server
-	TrustedKeys              []string              `json:"-"`
-	TrustedOperators         []*jwt.OperatorClaims `json:"-"`
-	AccountResolver          AccountResolver       `json:"-"`
-	AccountResolverTLSConfig *tls.Config           `json:"-"`
-	resolverPreloads         map[string]string
+	TrustedKeys      []string              `json:"-"`
+	TrustedOperators []*jwt.OperatorClaims `json:"-"`
+	AccountResolver  AccountResolver       `json:"-"`
+	resolverPreloads map[string]string
 
 	CustomClientAuthentication Authentication `json:"-"`
 	CustomRouterAuthentication Authentication `json:"-"`
 
 	// CheckConfig configuration file syntax test was successful and exit.
 	CheckConfig bool `json:"-"`
+
+	// Logger overrides the logger entry.
+	Logger *logrus.Entry `json:"-"`
 
 	// ConnectErrorReports specifies the number of failed attempts
 	// at which point server should report the failure of an initial
@@ -249,73 +194,6 @@ type Options struct {
 	// private fields, used for testing
 	gatewaysSolicitDelay time.Duration
 	routeProto           int
-}
-
-// WebsocketOpts ...
-type WebsocketOpts struct {
-	// The server will accept websocket client connections on this hostname/IP.
-	Host string
-	// The server will accept websocket client connections on this port.
-	Port int
-	// The host:port to advertise to websocket clients in the cluster.
-	Advertise string
-
-	// If no user is provided when a client connects, will default to this
-	// user and associated account. This user has to exist either in the
-	// Users defined here or in the global options.
-	NoAuthUser string
-
-	// Name of the cookie, which if present in WebSocket upgrade headers,
-	// will be treated as JWT during CONNECT phase as long as
-	// "jwt" specified in the CONNECT options is missing or empty.
-	JWTCookie string
-
-	// Authentication section. If anything is configured in this section,
-	// it will override the authorization configuration for regular clients.
-	Username string
-	Password string
-	Token    string
-	Users    []*User
-	Nkeys    []*NkeyUser
-
-	// Timeout for the authentication process.
-	AuthTimeout float64
-
-	// By default the server will enforce the use of TLS. If no TLS configuration
-	// is provided, you need to explicitly set NoTLS to true to allow the server
-	// to start without TLS configuration. Note that if a TLS configuration is
-	// present, this boolean is ignored and the server will run the Websocket
-	// server with that TLS configuration.
-	// Running without TLS is less secure since Websocket clients that use bearer
-	// tokens will send them in clear. So this should not be used in production.
-	NoTLS bool
-
-	// TLS configuration is required.
-	TLSConfig *tls.Config
-	// If true, map certificate values for authentication purposes.
-	TLSMap bool
-
-	// If true, the Origin header must match the request's host.
-	SameOrigin bool
-
-	// Only origins in this list will be accepted. If empty and
-	// SameOrigin is false, any origin is accepted.
-	AllowedOrigins []string
-
-	// If set to true, the server will negotiate with clients
-	// if compression can be used. If this is false, no compression
-	// will be used (both in server and clients) since it has to
-	// be negotiated between both endpoints
-	Compression bool
-
-	// Total time allowed for the server to read the client request
-	// and write the response back to the client. This include the
-	// time needed for the TLS Handshake.
-	HandshakeTimeout time.Duration
-}
-
-type netResolver interface {
-	LookupHost(ctx context.Context, host string) ([]string, error)
 }
 
 // Clone performs a deep copy of the Options struct, returning a new clone
@@ -339,18 +217,6 @@ func (o *Options) Clone() *Options {
 		}
 	}
 
-	if o.Routes != nil {
-		clone.Routes = deepCopyURLs(o.Routes)
-	}
-	if o.TLSConfig != nil {
-		clone.TLSConfig = o.TLSConfig.Clone()
-	}
-	if o.Cluster.TLSConfig != nil {
-		clone.Cluster.TLSConfig = o.Cluster.TLSConfig.Clone()
-	}
-	if o.Gateway.TLSConfig != nil {
-		clone.Gateway.TLSConfig = o.Gateway.TLSConfig.Clone()
-	}
 	if len(o.Gateway.Gateways) > 0 {
 		clone.Gateway.Gateways = make([]*RemoteGatewayOpts, len(o.Gateway.Gateways))
 		for i, g := range o.Gateway.Gateways {
@@ -359,19 +225,6 @@ func (o *Options) Clone() *Options {
 	}
 	// FIXME(dlc) - clone leaf node stuff.
 	return clone
-}
-
-func deepCopyURLs(urls []*url.URL) []*url.URL {
-	if urls == nil {
-		return nil
-	}
-	curls := make([]*url.URL, len(urls))
-	for i, u := range urls {
-		cu := &url.URL{}
-		*cu = *u
-		curls[i] = cu
-	}
-	return curls
 }
 
 // Configuration file authorization section.
@@ -387,46 +240,6 @@ type authorization struct {
 	timeout            float64
 	defaultPermissions *Permissions
 }
-
-// TLSConfigOpts holds the parsed tls config information,
-// used with flag parsing
-type TLSConfigOpts struct {
-	CertFile         string
-	KeyFile          string
-	CaFile           string
-	Verify           bool
-	Insecure         bool
-	Map              bool
-	Timeout          float64
-	Ciphers          []uint16
-	CurvePreferences []tls.CurveID
-}
-
-var tlsUsage = `
-TLS configuration is specified in the tls section of a configuration file:
-
-e.g.
-
-    tls {
-        cert_file:      "./certs/server-cert.pem"
-        key_file:       "./certs/server-key.pem"
-        ca_file:        "./certs/ca.pem"
-        verify:         true
-        verify_and_map: true
-
-        cipher_suites: [
-            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-        ]
-        curve_preferences: [
-            "CurveP256",
-            "CurveP384",
-            "CurveP521"
-        ]
-    }
-
-Available cipher suites include:
-`
 
 // ProcessConfigFile processes a configuration file.
 // FIXME(dlc): A bit hacky
@@ -573,22 +386,8 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 
 	tk, v := unwrapValue(v, &lt)
 	switch strings.ToLower(k) {
-	case "listen":
-		hp, err := parseListen(v)
-		if err != nil {
-			*errors = append(*errors, &configErr{tk, err.Error()})
-			return
-		}
-		o.Host = hp.host
-		o.Port = hp.port
-	case "client_advertise":
-		o.ClientAdvertise = v.(string)
-	case "port":
-		o.Port = int(v.(int64))
 	case "server_name":
 		o.ServerName = v.(string)
-	case "host", "net":
-		o.Host = v.(string)
 	case "debug":
 		o.Debug = v.(bool)
 		trackExplicitVal(o, &o.inConfig, "Debug", o.Debug)
@@ -648,28 +447,6 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 			// NKeys may have been added from Accounts parsing, so do an append here
 			o.Nkeys = append(o.Nkeys, auth.nkeys...)
 		}
-	case "http":
-		hp, err := parseListen(v)
-		if err != nil {
-			err := &configErr{tk, err.Error()}
-			*errors = append(*errors, err)
-			return
-		}
-		o.HTTPHost = hp.host
-		o.HTTPPort = hp.port
-	case "https":
-		hp, err := parseListen(v)
-		if err != nil {
-			err := &configErr{tk, err.Error()}
-			*errors = append(*errors, err)
-			return
-		}
-		o.HTTPHost = hp.host
-		o.HTTPSPort = hp.port
-	case "http_port", "monitor_port":
-		o.HTTPPort = int(v.(int64))
-	case "https_port":
-		o.HTTPSPort = int(v.(int64))
 	case "http_base_path":
 		o.HTTPBasePath = v.(string)
 	case "cluster":
@@ -695,21 +472,6 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 			*errors = append(*errors, err)
 			return
 		}
-	case "logfile", "log_file":
-		o.LogFile = v.(string)
-	case "logfile_size_limit", "log_size_limit":
-		o.LogSizeLimit = v.(int64)
-	case "syslog":
-		o.Syslog = v.(bool)
-		trackExplicitVal(o, &o.inConfig, "Syslog", o.Syslog)
-	case "remote_syslog":
-		o.RemoteSyslog = v.(string)
-	case "pidfile", "pid_file":
-		o.PidFile = v.(string)
-	case "ports_file_dir":
-		o.PortsFileDir = v.(string)
-	case "prof_port":
-		o.ProfPort = int(v.(int64))
 	case "max_control_line":
 		if v.(int64) > 1<<31-1 {
 			err := &configErr{tk, fmt.Sprintf("%s value is too big", k)}
@@ -736,22 +498,6 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 		o.PingInterval = parseDuration("ping_interval", tk, v, errors, warnings)
 	case "ping_max":
 		o.MaxPingsOut = int(v.(int64))
-	case "tls":
-		tc, err := parseTLS(tk)
-		if err != nil {
-			*errors = append(*errors, err)
-			return
-		}
-		if o.TLSConfig, err = GenTLSConfig(tc); err != nil {
-			err := &configErr{tk, err.Error()}
-			*errors = append(*errors, err)
-			return
-		}
-		o.TLSTimeout = tc.Timeout
-		o.TLSMap = tc.Map
-
-	case "allow_non_tls":
-		o.AllowNonTLS = v.(bool)
 	case "write_deadline":
 		o.WriteDeadline = parseDuration("write_deadline", tk, v, errors, warnings)
 	case "lame_duck_duration":
@@ -840,62 +586,6 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 					o.AccountResolver = ur
 				}
 			}
-		case map[string]interface{}:
-			dir := ""
-			dirType := ""
-			limit := int64(0)
-			ttl := time.Duration(0)
-			sync := time.Duration(0)
-			var err error
-			if v, ok := v["dir"]; ok {
-				_, v := unwrapValue(v, &lt)
-				dir = v.(string)
-			}
-			if v, ok := v["type"]; ok {
-				_, v := unwrapValue(v, &lt)
-				dirType = v.(string)
-			}
-			if v, ok := v["limit"]; ok {
-				_, v := unwrapValue(v, &lt)
-				limit = v.(int64)
-			}
-			if v, ok := v["ttl"]; ok {
-				_, v := unwrapValue(v, &lt)
-				ttl, err = time.ParseDuration(v.(string))
-			}
-			if v, ok := v["interval"]; err == nil && ok {
-				_, v := unwrapValue(v, &lt)
-				sync, err = time.ParseDuration(v.(string))
-			}
-			if err != nil {
-				*errors = append(*errors, &configErr{tk, err.Error()})
-				return
-			}
-			if dir == "" {
-				*errors = append(*errors, &configErr{tk, "dir needs to point to a directory"})
-				return
-			}
-			if info, err := os.Stat(dir); err != nil || !info.IsDir() || info.Mode().Perm()&(1<<(uint(7))) == 0 {
-				info.IsDir()
-			}
-			var res AccountResolver
-			switch strings.ToUpper(dirType) {
-			case "CACHE":
-				if sync != 0 {
-					*errors = append(*errors, &configErr{tk, "CACHE does not accept sync"})
-				}
-				res, err = NewCacheDirAccResolver(dir, limit, ttl)
-			case "FULL":
-				if ttl != 0 {
-					*errors = append(*errors, &configErr{tk, "FULL does not accept ttl"})
-				}
-				res, err = NewDirAccResolver(dir, limit, sync)
-			}
-			if err != nil {
-				*errors = append(*errors, &configErr{tk, err.Error()})
-				return
-			}
-			o.AccountResolver = res
 		default:
 			err := &configErr{tk, fmt.Sprintf("error parsing operator resolver, wrong type %T", v)}
 			*errors = append(*errors, err)
@@ -905,17 +595,6 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 			err := &configErr{tk, "error parsing account resolver, should be MEM or " +
 				" URL(\"url\") or a map containing dir and type state=[FULL|CACHE])"}
 			*errors = append(*errors, err)
-		}
-	case "resolver_tls":
-		tc, err := parseTLS(tk)
-		if err != nil {
-			*errors = append(*errors, err)
-			return
-		}
-		if o.AccountResolverTLSConfig, err = GenTLSConfig(tc); err != nil {
-			err := &configErr{tk, err.Error()}
-			*errors = append(*errors, err)
-			return
 		}
 	case "resolver_preload":
 		mp, ok := v.(map[string]interface{})
@@ -976,21 +655,18 @@ func (o *Options) processConfigFileLine(k string, v interface{}, errors *[]error
 			*errors = append(*errors, err)
 		}
 		// Do a quick sanity check on keys
-		for _, key := range o.TrustedKeys {
-			if !nkeys.IsValidPublicOperatorKey(key) {
-				err := &configErr{tk, fmt.Sprintf("trust key %q required to be a valid public operator nkey", key)}
-				*errors = append(*errors, err)
+		/*
+			for _, key := range o.TrustedKeys {
+				if !nkeys.IsValidPublicOperatorKey(key) {
+					err := &configErr{tk, fmt.Sprintf("trust key %q required to be a valid public operator nkey", key)}
+					*errors = append(*errors, err)
+				}
 			}
-		}
+		*/
 	case "connect_error_reports":
 		o.ConnectErrorReports = int(v.(int64))
 	case "reconnect_error_reports":
 		o.ReconnectErrorReports = int(v.(int64))
-	case "websocket", "ws":
-		if err := parseWebsocket(tk, o, errors, warnings); err != nil {
-			*errors = append(*errors, err)
-			return
-		}
 	default:
 		if au := atomic.LoadInt32(&allowUnknownTopLevelField); au == 0 && !tk.IsUsedVariable() {
 			err := &unknownConfigFieldErr{
@@ -1043,29 +719,6 @@ type hostPort struct {
 	port int
 }
 
-// parseListen will parse listen option which is replacing host/net and port
-func parseListen(v interface{}) (*hostPort, error) {
-	hp := &hostPort{}
-	switch vv := v.(type) {
-	// Only a port
-	case int64:
-		hp.port = int(vv)
-	case string:
-		host, port, err := net.SplitHostPort(vv)
-		if err != nil {
-			return nil, fmt.Errorf("could not parse address string %q", vv)
-		}
-		hp.port, err = strconv.Atoi(port)
-		if err != nil {
-			return nil, fmt.Errorf("could not parse port %q", port)
-		}
-		hp.host = host
-	default:
-		return nil, fmt.Errorf("expected port or host:port, got %T", vv)
-	}
-	return hp, nil
-}
-
 // parseCluster will parse the cluster config.
 func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]error) error {
 	var lt token
@@ -1083,19 +736,6 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 		switch strings.ToLower(mk) {
 		case "name":
 			opts.Cluster.Name = mv.(string)
-		case "listen":
-			hp, err := parseListen(mv)
-			if err != nil {
-				err := &configErr{tk, err.Error()}
-				*errors = append(*errors, err)
-				continue
-			}
-			opts.Cluster.Host = hp.host
-			opts.Cluster.Port = hp.port
-		case "port":
-			opts.Cluster.Port = int(mv.(int64))
-		case "host", "net":
-			opts.Cluster.Host = mv.(string)
 		case "authorization":
 			auth, err := parseAuthorization(tk, opts, errors, warnings)
 			if err != nil {
@@ -1126,28 +766,6 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 					setClusterPermissions(&opts.Cluster, auth.defaultPermissions)
 				}
 			}
-		case "routes":
-			ra := mv.([]interface{})
-			routes, errs := parseURLs(ra, "route")
-			if errs != nil {
-				*errors = append(*errors, errs...)
-				continue
-			}
-			opts.Routes = routes
-		case "tls":
-			config, tlsopts, err := getTLSConfig(tk)
-			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			opts.Cluster.TLSConfig = config
-			opts.Cluster.TLSTimeout = tlsopts.Timeout
-			opts.Cluster.TLSMap = tlsopts.Map
-		case "cluster_advertise", "advertise":
-			opts.Cluster.Advertise = mv.(string)
-		case "no_advertise":
-			opts.Cluster.NoAdvertise = mv.(bool)
-			trackExplicitVal(opts, &opts.inConfig, "Cluster.NoAdvertise", opts.Cluster.NoAdvertise)
 		case "connect_retries":
 			opts.Cluster.ConnectRetries = int(mv.(int64))
 		case "permissions":
@@ -1180,25 +798,6 @@ func parseCluster(v interface{}, opts *Options, errors *[]error, warnings *[]err
 	return nil
 }
 
-func parseURLs(a []interface{}, typ string) (urls []*url.URL, errors []error) {
-	urls = make([]*url.URL, 0, len(a))
-	var lt token
-	defer convertPanicToErrorList(&lt, &errors)
-
-	for _, u := range a {
-		tk, u := unwrapValue(u, &lt)
-		sURL := u.(string)
-		url, err := parseURL(sURL, typ)
-		if err != nil {
-			err := &configErr{tk, err.Error()}
-			errors = append(errors, err)
-			continue
-		}
-		urls = append(urls, url)
-	}
-	return urls, errors
-}
-
 func parseURL(u string, typ string) (*url.URL, error) {
 	urlStr := strings.TrimSpace(u)
 	url, err := url.Parse(urlStr)
@@ -1223,19 +822,6 @@ func parseGateway(v interface{}, o *Options, errors *[]error, warnings *[]error)
 		switch strings.ToLower(mk) {
 		case "name":
 			o.Gateway.Name = mv.(string)
-		case "listen":
-			hp, err := parseListen(mv)
-			if err != nil {
-				err := &configErr{tk, err.Error()}
-				*errors = append(*errors, err)
-				continue
-			}
-			o.Gateway.Host = hp.host
-			o.Gateway.Port = hp.port
-		case "port":
-			o.Gateway.Port = int(mv.(int64))
-		case "host", "net":
-			o.Gateway.Host = mv.(string)
 		case "authorization":
 			auth, err := parseAuthorization(tk, o, errors, warnings)
 			if err != nil {
@@ -1249,17 +835,6 @@ func parseGateway(v interface{}, o *Options, errors *[]error, warnings *[]error)
 			o.Gateway.Username = auth.user
 			o.Gateway.Password = auth.pass
 			o.Gateway.AuthTimeout = auth.timeout
-		case "tls":
-			config, tlsopts, err := getTLSConfig(tk)
-			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			o.Gateway.TLSConfig = config
-			o.Gateway.TLSTimeout = tlsopts.Timeout
-			o.Gateway.TLSMap = tlsopts.Map
-		case "advertise":
-			o.Gateway.Advertise = mv.(string)
 		case "connect_retries":
 			o.Gateway.ConnectRetries = int(mv.(int64))
 		case "gateways":
@@ -1424,19 +999,6 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 		// Again, unwrap token value if line check is required.
 		tk, mv = unwrapValue(mv, &lt)
 		switch strings.ToLower(mk) {
-		case "listen":
-			hp, err := parseListen(mv)
-			if err != nil {
-				err := &configErr{tk, err.Error()}
-				*errors = append(*errors, err)
-				continue
-			}
-			opts.LeafNode.Host = hp.host
-			opts.LeafNode.Port = hp.port
-		case "port":
-			opts.LeafNode.Port = int(mv.(int64))
-		case "host", "net":
-			opts.LeafNode.Host = mv.(string)
 		case "authorization":
 			auth, err := parseLeafAuthorization(tk, errors, warnings)
 			if err != nil {
@@ -1462,23 +1024,6 @@ func parseLeafNodes(v interface{}, opts *Options, errors *[]error, warnings *[]e
 			opts.LeafNode.Remotes = remotes
 		case "reconnect", "reconnect_delay", "reconnect_interval":
 			opts.LeafNode.ReconnectInterval = time.Duration(int(mv.(int64))) * time.Second
-		case "tls":
-			tc, err := parseTLS(tk)
-			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			if opts.LeafNode.TLSConfig, err = GenTLSConfig(tc); err != nil {
-				err := &configErr{tk, err.Error()}
-				*errors = append(*errors, err)
-				continue
-			}
-			opts.LeafNode.TLSTimeout = tc.Timeout
-		case "leafnode_advertise", "advertise":
-			opts.LeafNode.Advertise = mv.(string)
-		case "no_advertise":
-			opts.LeafNode.NoAdvertise = mv.(bool)
-			trackExplicitVal(opts, &opts.inConfig, "LeafNode.NoAdvertise", opts.LeafNode.NoAdvertise)
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{
@@ -1631,23 +1176,6 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 		for k, v := range rm {
 			tk, v = unwrapValue(v, &lt)
 			switch strings.ToLower(k) {
-			case "url", "urls":
-				switch v := v.(type) {
-				case []interface{}, []string:
-					urls, errs := parseURLs(v.([]interface{}), "leafnode")
-					if errs != nil {
-						*errors = append(*errors, errs...)
-						continue
-					}
-					remote.URLs = urls
-				case string:
-					url, err := parseURL(v, "leafnode")
-					if err != nil {
-						*errors = append(*errors, &configErr{tk, err.Error()})
-						continue
-					}
-					remote.URLs = append(remote.URLs, url)
-				}
 			case "account", "local":
 				remote.LocalAccount = v.(string)
 			case "creds", "credentials":
@@ -1657,25 +1185,6 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 					continue
 				}
 				remote.Credentials = p
-			case "tls":
-				tc, err := parseTLS(tk)
-				if err != nil {
-					*errors = append(*errors, err)
-					continue
-				}
-				if remote.TLSConfig, err = GenTLSConfig(tc); err != nil {
-					*errors = append(*errors, &configErr{tk, err.Error()})
-					continue
-				}
-				// If ca_file is defined, GenTLSConfig() sets TLSConfig.ClientCAs.
-				// Set RootCAs since this tls.Config is used when soliciting
-				// a connection (therefore behaves as a client).
-				remote.TLSConfig.RootCAs = remote.TLSConfig.ClientCAs
-				if tc.Timeout > 0 {
-					remote.TLSTimeout = tc.Timeout
-				} else {
-					remote.TLSTimeout = float64(DEFAULT_LEAF_TLS_TIMEOUT)
-				}
 			case "hub":
 				remote.Hub = v.(bool)
 			case "deny_imports", "deny_import":
@@ -1710,26 +1219,6 @@ func parseRemoteLeafNodes(v interface{}, errors *[]error, warnings *[]error) ([]
 	return remotes, nil
 }
 
-// Parse TLS and returns a TLSConfig and TLSTimeout.
-// Used by cluster and gateway parsing.
-func getTLSConfig(tk token) (*tls.Config, *TLSConfigOpts, error) {
-	tc, err := parseTLS(tk)
-	if err != nil {
-		return nil, nil, err
-	}
-	config, err := GenTLSConfig(tc)
-	if err != nil {
-		err := &configErr{tk, err.Error()}
-		return nil, nil, err
-	}
-	// For clusters/gateways, we will force strict verification. We also act
-	// as both client and server, so will mirror the rootCA to the
-	// clientCA pool.
-	config.ClientAuth = tls.RequireAndVerifyClientCert
-	config.RootCAs = config.ClientCAs
-	return config, tc, nil
-}
-
 func parseGateways(v interface{}, errors *[]error, warnings *[]error) ([]*RemoteGatewayOpts, error) {
 	var lt token
 	defer convertPanicToErrorList(&lt, errors)
@@ -1755,28 +1244,6 @@ func parseGateways(v interface{}, errors *[]error, warnings *[]error) ([]*Remote
 			switch strings.ToLower(k) {
 			case "name":
 				gateway.Name = v.(string)
-			case "tls":
-				tls, tlsopts, err := getTLSConfig(tk)
-				if err != nil {
-					*errors = append(*errors, err)
-					continue
-				}
-				gateway.TLSConfig = tls
-				gateway.TLSTimeout = tlsopts.Timeout
-			case "url":
-				url, err := parseURL(v.(string), "gateway")
-				if err != nil {
-					*errors = append(*errors, &configErr{tk, err.Error()})
-					continue
-				}
-				gateway.URLs = append(gateway.URLs, url)
-			case "urls":
-				urls, errs := parseURLs(v.([]interface{}), "gateway")
-				if errs != nil {
-					*errors = append(*errors, errs...)
-					continue
-				}
-				gateway.URLs = urls
 			default:
 				if !tk.IsUsedVariable() {
 					err := &unknownConfigFieldErr{
@@ -1911,7 +1378,7 @@ func parseAccounts(v interface{}, opts *Options, errors *[]error, warnings *[]er
 				switch strings.ToLower(k) {
 				case "nkey":
 					nk, ok := mv.(string)
-					if !ok || !nkeys.IsValidPublicAccountKey(nk) {
+					if !ok { // || !nkeys.IsValidPublicAccountKey(nk) {
 						err := &configErr{tk, fmt.Sprintf("Not a valid public nkey for an account: %q", mv)}
 						*errors = append(*errors, err)
 						continue
@@ -2736,9 +2203,11 @@ func parseUsers(mv interface{}, opts *Options, errors *[]error, warnings *[]erro
 			return nil, nil, &configErr{tk, "User entry requires a user"}
 		} else if nkey.Nkey != "" {
 			// Make sure the nkey a proper public nkey for a user..
-			if !nkeys.IsValidPublicUserKey(nkey.Nkey) {
-				return nil, nil, &configErr{tk, "Not a valid public nkey for a user"}
-			}
+			/*
+				if !nkeys.IsValidPublicUserKey(nkey.Nkey) {
+					return nil, nil, &configErr{tk, "Not a valid public nkey for a user"}
+				}
+			*/
 			// If we have user or password defined here that is an error.
 			if user.Username != "" || user.Password != "" {
 				return nil, nil, &configErr{tk, "Nkey users do not take usernames or passwords"}
@@ -2977,333 +2446,6 @@ func checkSubjectArray(sa []string) error {
 	return nil
 }
 
-// PrintTLSHelpAndDie prints TLS usage and exits.
-func PrintTLSHelpAndDie() {
-	fmt.Printf("%s", tlsUsage)
-	for k := range cipherMap {
-		fmt.Printf("    %s\n", k)
-	}
-	fmt.Printf("\nAvailable curve preferences include:\n")
-	for k := range curvePreferenceMap {
-		fmt.Printf("    %s\n", k)
-	}
-	os.Exit(0)
-}
-
-func parseCipher(cipherName string) (uint16, error) {
-	cipher, exists := cipherMap[cipherName]
-	if !exists {
-		return 0, fmt.Errorf("unrecognized cipher %s", cipherName)
-	}
-
-	return cipher, nil
-}
-
-func parseCurvePreferences(curveName string) (tls.CurveID, error) {
-	curve, exists := curvePreferenceMap[curveName]
-	if !exists {
-		return 0, fmt.Errorf("unrecognized curve preference %s", curveName)
-	}
-	return curve, nil
-}
-
-// Helper function to parse TLS configs.
-func parseTLS(v interface{}) (t *TLSConfigOpts, retErr error) {
-	var (
-		tlsm map[string]interface{}
-		tc   = TLSConfigOpts{}
-		lt   token
-	)
-	defer convertPanicToError(&lt, &retErr)
-
-	_, v = unwrapValue(v, &lt)
-	tlsm = v.(map[string]interface{})
-	for mk, mv := range tlsm {
-		tk, mv := unwrapValue(mv, &lt)
-		switch strings.ToLower(mk) {
-		case "cert_file":
-			certFile, ok := mv.(string)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'cert_file' to be filename"}
-			}
-			tc.CertFile = certFile
-		case "key_file":
-			keyFile, ok := mv.(string)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'key_file' to be filename"}
-			}
-			tc.KeyFile = keyFile
-		case "ca_file":
-			caFile, ok := mv.(string)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'ca_file' to be filename"}
-			}
-			tc.CaFile = caFile
-		case "insecure":
-			insecure, ok := mv.(bool)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'insecure' to be a boolean"}
-			}
-			tc.Insecure = insecure
-		case "verify":
-			verify, ok := mv.(bool)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'verify' to be a boolean"}
-			}
-			tc.Verify = verify
-		case "verify_and_map":
-			verify, ok := mv.(bool)
-			if !ok {
-				return nil, &configErr{tk, "error parsing tls config, expected 'verify_and_map' to be a boolean"}
-			}
-			tc.Verify = verify
-			tc.Map = verify
-		case "cipher_suites":
-			ra := mv.([]interface{})
-			if len(ra) == 0 {
-				return nil, &configErr{tk, "error parsing tls config, 'cipher_suites' cannot be empty"}
-			}
-			tc.Ciphers = make([]uint16, 0, len(ra))
-			for _, r := range ra {
-				tk, r := unwrapValue(r, &lt)
-				cipher, err := parseCipher(r.(string))
-				if err != nil {
-					return nil, &configErr{tk, err.Error()}
-				}
-				tc.Ciphers = append(tc.Ciphers, cipher)
-			}
-		case "curve_preferences":
-			ra := mv.([]interface{})
-			if len(ra) == 0 {
-				return nil, &configErr{tk, "error parsing tls config, 'curve_preferences' cannot be empty"}
-			}
-			tc.CurvePreferences = make([]tls.CurveID, 0, len(ra))
-			for _, r := range ra {
-				tk, r := unwrapValue(r, &lt)
-				cps, err := parseCurvePreferences(r.(string))
-				if err != nil {
-					return nil, &configErr{tk, err.Error()}
-				}
-				tc.CurvePreferences = append(tc.CurvePreferences, cps)
-			}
-		case "timeout":
-			at := float64(0)
-			switch mv := mv.(type) {
-			case int64:
-				at = float64(mv)
-			case float64:
-				at = mv
-			}
-			tc.Timeout = at
-		default:
-			return nil, &configErr{tk, fmt.Sprintf("error parsing tls config, unknown field [%q]", mk)}
-		}
-	}
-
-	// If cipher suites were not specified then use the defaults
-	if tc.Ciphers == nil {
-		tc.Ciphers = defaultCipherSuites()
-	}
-
-	// If curve preferences were not specified, then use the defaults
-	if tc.CurvePreferences == nil {
-		tc.CurvePreferences = defaultCurvePreferences()
-	}
-
-	return &tc, nil
-}
-
-func parseWebsocket(v interface{}, o *Options, errors *[]error, warnings *[]error) error {
-	var lt token
-	defer convertPanicToErrorList(&lt, errors)
-
-	tk, v := unwrapValue(v, &lt)
-	gm, ok := v.(map[string]interface{})
-	if !ok {
-		return &configErr{tk, fmt.Sprintf("Expected websocket to be a map, got %T", v)}
-	}
-	for mk, mv := range gm {
-		// Again, unwrap token value if line check is required.
-		tk, mv = unwrapValue(mv, &lt)
-		switch strings.ToLower(mk) {
-		case "listen":
-			hp, err := parseListen(mv)
-			if err != nil {
-				err := &configErr{tk, err.Error()}
-				*errors = append(*errors, err)
-				continue
-			}
-			o.Websocket.Host = hp.host
-			o.Websocket.Port = hp.port
-		case "port":
-			o.Websocket.Port = int(mv.(int64))
-		case "host", "net":
-			o.Websocket.Host = mv.(string)
-		case "advertise":
-			o.Websocket.Advertise = mv.(string)
-		case "no_tls":
-			o.Websocket.NoTLS = mv.(bool)
-		case "tls":
-			tc, err := parseTLS(tk)
-			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			if o.Websocket.TLSConfig, err = GenTLSConfig(tc); err != nil {
-				err := &configErr{tk, err.Error()}
-				*errors = append(*errors, err)
-				continue
-			}
-			o.Websocket.TLSMap = tc.Map
-		case "same_origin":
-			o.Websocket.SameOrigin = mv.(bool)
-		case "allowed_origins", "allowed_origin", "allow_origins", "allow_origin", "origins", "origin":
-			switch mv := mv.(type) {
-			case string:
-				o.Websocket.AllowedOrigins = []string{mv}
-			case []interface{}:
-				keys := make([]string, 0, len(mv))
-				for _, val := range mv {
-					tk, val = unwrapValue(val, &lt)
-					if key, ok := val.(string); ok {
-						keys = append(keys, key)
-					} else {
-						err := &configErr{tk, fmt.Sprintf("error parsing allowed origins: unsupported type in array %T", val)}
-						*errors = append(*errors, err)
-						continue
-					}
-				}
-				o.Websocket.AllowedOrigins = keys
-			default:
-				err := &configErr{tk, fmt.Sprintf("error parsing allowed origins: unsupported type %T", mv)}
-				*errors = append(*errors, err)
-			}
-		case "handshake_timeout":
-			ht := time.Duration(0)
-			switch mv := mv.(type) {
-			case int64:
-				ht = time.Duration(mv) * time.Second
-			case string:
-				var err error
-				ht, err = time.ParseDuration(mv)
-				if err != nil {
-					err := &configErr{tk, err.Error()}
-					*errors = append(*errors, err)
-					continue
-				}
-			default:
-				err := &configErr{tk, fmt.Sprintf("error parsing handshake timeout: unsupported type %T", mv)}
-				*errors = append(*errors, err)
-			}
-			o.Websocket.HandshakeTimeout = ht
-		case "compression":
-			o.Websocket.Compression = mv.(bool)
-		case "authorization", "authentication":
-			auth, err := parseAuthorization(tk, o, errors, warnings)
-			if err != nil {
-				*errors = append(*errors, err)
-				continue
-			}
-			o.Websocket.Username = auth.user
-			o.Websocket.Password = auth.pass
-			o.Websocket.Token = auth.token
-			if (auth.user != "" || auth.pass != "") && auth.token != "" {
-				err := &configErr{tk, "Cannot have a user/pass and token"}
-				*errors = append(*errors, err)
-				continue
-			}
-			o.Websocket.AuthTimeout = auth.timeout
-			// Check for multiple users defined
-			if auth.users != nil {
-				if auth.user != "" {
-					err := &configErr{tk, "Can not have a single user/pass and a users array"}
-					*errors = append(*errors, err)
-					continue
-				}
-				if auth.token != "" {
-					err := &configErr{tk, "Can not have a token and a users array"}
-					*errors = append(*errors, err)
-					continue
-				}
-				// Users may have been added from Accounts parsing, so do an append here
-				o.Websocket.Users = append(o.Websocket.Users, auth.users...)
-			}
-			// Check for nkeys
-			if auth.nkeys != nil {
-				o.Websocket.Nkeys = append(o.Websocket.Nkeys, auth.nkeys...)
-			}
-		case "jwt_cookie":
-			o.Websocket.JWTCookie = mv.(string)
-		case "no_auth_user":
-			o.Websocket.NoAuthUser = mv.(string)
-		default:
-			if !tk.IsUsedVariable() {
-				err := &unknownConfigFieldErr{
-					field: mk,
-					configErr: configErr{
-						token: tk,
-					},
-				}
-				*errors = append(*errors, err)
-				continue
-			}
-		}
-	}
-	return nil
-}
-
-// GenTLSConfig loads TLS related configuration parameters.
-func GenTLSConfig(tc *TLSConfigOpts) (*tls.Config, error) {
-	// Create the tls.Config from our options before including the certs.
-	// It will determine the cipher suites that we prefer.
-	// FIXME(dlc) change if ARM based.
-	config := tls.Config{
-		MinVersion:               tls.VersionTLS12,
-		CipherSuites:             tc.Ciphers,
-		PreferServerCipherSuites: true,
-		CurvePreferences:         tc.CurvePreferences,
-		InsecureSkipVerify:       tc.Insecure,
-	}
-
-	switch {
-	case tc.CertFile != "" && tc.KeyFile == "":
-		return nil, fmt.Errorf("missing 'key_file' in TLS configuration")
-	case tc.CertFile == "" && tc.KeyFile != "":
-		return nil, fmt.Errorf("missing 'cert_file' in TLS configuration")
-	case tc.CertFile != "" && tc.KeyFile != "":
-		// Now load in cert and private key
-		cert, err := tls.LoadX509KeyPair(tc.CertFile, tc.KeyFile)
-		if err != nil {
-			return nil, fmt.Errorf("error parsing X509 certificate/key pair: %v", err)
-		}
-		cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
-		if err != nil {
-			return nil, fmt.Errorf("error parsing certificate: %v", err)
-		}
-		config.Certificates = []tls.Certificate{cert}
-	}
-
-	// Require client certificates as needed
-	if tc.Verify {
-		config.ClientAuth = tls.RequireAndVerifyClientCert
-	}
-	// Add in CAs if applicable.
-	if tc.CaFile != "" {
-		rootPEM, err := ioutil.ReadFile(tc.CaFile)
-		if err != nil || rootPEM == nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		ok := pool.AppendCertsFromPEM(rootPEM)
-		if !ok {
-			return nil, fmt.Errorf("failed to parse root ca certificate")
-		}
-		config.ClientCAs = pool
-	}
-
-	return &config, nil
-}
-
 // MergeOptions will merge two options giving preference to the flagOpts
 // if the item is present.
 func MergeOptions(fileOpts, flagOpts *Options) *Options {
@@ -3316,15 +2458,6 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	// Merge the two, flagOpts override
 	opts := *fileOpts
 
-	if flagOpts.Port != 0 {
-		opts.Port = flagOpts.Port
-	}
-	if flagOpts.Host != "" {
-		opts.Host = flagOpts.Host
-	}
-	if flagOpts.ClientAdvertise != "" {
-		opts.ClientAdvertise = flagOpts.ClientAdvertise
-	}
 	if flagOpts.Username != "" {
 		opts.Username = flagOpts.Username
 	}
@@ -3333,9 +2466,6 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	}
 	if flagOpts.Authorization != "" {
 		opts.Authorization = flagOpts.Authorization
-	}
-	if flagOpts.HTTPPort != 0 {
-		opts.HTTPPort = flagOpts.HTTPPort
 	}
 	if flagOpts.HTTPBasePath != "" {
 		opts.HTTPBasePath = flagOpts.HTTPBasePath
@@ -3349,32 +2479,8 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	if flagOpts.Logtime {
 		opts.Logtime = true
 	}
-	if flagOpts.LogFile != "" {
-		opts.LogFile = flagOpts.LogFile
-	}
-	if flagOpts.PidFile != "" {
-		opts.PidFile = flagOpts.PidFile
-	}
-	if flagOpts.PortsFileDir != "" {
-		opts.PortsFileDir = flagOpts.PortsFileDir
-	}
-	if flagOpts.ProfPort != 0 {
-		opts.ProfPort = flagOpts.ProfPort
-	}
-	if flagOpts.Cluster.ListenStr != "" {
-		opts.Cluster.ListenStr = flagOpts.Cluster.ListenStr
-	}
-	if flagOpts.Cluster.NoAdvertise {
-		opts.Cluster.NoAdvertise = true
-	}
 	if flagOpts.Cluster.ConnectRetries != 0 {
 		opts.Cluster.ConnectRetries = flagOpts.Cluster.ConnectRetries
-	}
-	if flagOpts.Cluster.Advertise != "" {
-		opts.Cluster.Advertise = flagOpts.Cluster.Advertise
-	}
-	if flagOpts.RoutesStr != "" {
-		mergeRoutes(&opts, flagOpts)
 	}
 	return &opts
 }
@@ -3392,16 +2498,6 @@ func RoutesFromStr(routesStr string) []*url.URL {
 		routeUrls = append(routeUrls, u)
 	}
 	return routeUrls
-}
-
-// This will merge the flag routes and override anything that was present.
-func mergeRoutes(opts, flagOpts *Options) {
-	routeUrls := RoutesFromStr(flagOpts.RoutesStr)
-	if routeUrls == nil {
-		return
-	}
-	opts.Routes = routeUrls
-	opts.RoutesStr = flagOpts.RoutesStr
 }
 
 // RemoveSelfReference removes this server from an array of routes
@@ -3486,19 +2582,6 @@ func getInterfaceIPs() ([]net.IP, error) {
 
 func setBaselineOptions(opts *Options) {
 	// Setup non-standard Go defaults
-	if opts.Host == "" {
-		opts.Host = DEFAULT_HOST
-	}
-	if opts.HTTPHost == "" {
-		// Default to same bind from server if left undefined
-		opts.HTTPHost = opts.Host
-	}
-	if opts.Port == 0 {
-		opts.Port = DEFAULT_PORT
-	} else if opts.Port == RANDOM_PORT {
-		// Choose randomly inside of net.Listen
-		opts.Port = 0
-	}
 	if opts.MaxConn == 0 {
 		opts.MaxConn = DEFAULT_MAX_CONNECTIONS
 	}
@@ -3508,43 +2591,14 @@ func setBaselineOptions(opts *Options) {
 	if opts.MaxPingsOut == 0 {
 		opts.MaxPingsOut = DEFAULT_PING_MAX_OUT
 	}
-	if opts.TLSTimeout == 0 {
-		opts.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
-	}
 	if opts.AuthTimeout == 0 {
 		opts.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 	}
-	if opts.Cluster.Port != 0 {
-		if opts.Cluster.Host == "" {
-			opts.Cluster.Host = DEFAULT_HOST
-		}
-		if opts.Cluster.TLSTimeout == 0 {
-			opts.Cluster.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
-		}
-		if opts.Cluster.AuthTimeout == 0 {
-			opts.Cluster.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
-		}
+	if opts.Cluster.AuthTimeout == 0 {
+		opts.Cluster.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 	}
-	if opts.LeafNode.Port != 0 {
-		if opts.LeafNode.Host == "" {
-			opts.LeafNode.Host = DEFAULT_HOST
-		}
-		if opts.LeafNode.TLSTimeout == 0 {
-			opts.LeafNode.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
-		}
-		if opts.LeafNode.AuthTimeout == 0 {
-			opts.LeafNode.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
-		}
-	}
-	// Set baseline connect port for remotes.
-	for _, r := range opts.LeafNode.Remotes {
-		if r != nil {
-			for _, u := range r.URLs {
-				if u.Port() == "" {
-					u.Host = net.JoinHostPort(u.Host, strconv.Itoa(DEFAULT_LEAFNODE_PORT))
-				}
-			}
-		}
+	if opts.LeafNode.AuthTimeout == 0 {
+		opts.LeafNode.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
 	}
 
 	// Set this regardless of opts.LeafNode.Port
@@ -3573,27 +2627,11 @@ func setBaselineOptions(opts *Options) {
 	if opts.LameDuckGracePeriod == 0 {
 		opts.LameDuckGracePeriod = DEFAULT_LAME_DUCK_GRACE_PERIOD
 	}
-	if opts.Gateway.Port != 0 {
-		if opts.Gateway.Host == "" {
-			opts.Gateway.Host = DEFAULT_HOST
-		}
-		if opts.Gateway.TLSTimeout == 0 {
-			opts.Gateway.TLSTimeout = float64(TLS_TIMEOUT) / float64(time.Second)
-		}
-		if opts.Gateway.AuthTimeout == 0 {
-			opts.Gateway.AuthTimeout = float64(AUTH_TIMEOUT) / float64(time.Second)
-		}
-	}
 	if opts.ConnectErrorReports == 0 {
 		opts.ConnectErrorReports = DEFAULT_CONNECT_ERROR_REPORTS
 	}
 	if opts.ReconnectErrorReports == 0 {
 		opts.ReconnectErrorReports = DEFAULT_RECONNECT_ERROR_REPORTS
-	}
-	if opts.Websocket.Port != 0 {
-		if opts.Websocket.Host == "" {
-			opts.Websocket.Host = DEFAULT_HOST
-		}
 	}
 	// JetStream
 	if opts.JetStreamMaxMemory == 0 {
@@ -3602,266 +2640,6 @@ func setBaselineOptions(opts *Options) {
 	if opts.JetStreamMaxStore == 0 {
 		opts.JetStreamMaxStore = -1
 	}
-}
-
-// ConfigureOptions accepts a flag set and augments it with NATS Server
-// specific flags. On success, an options structure is returned configured
-// based on the selected flags and/or configuration file.
-// The command line options take precedence to the ones in the configuration file.
-func ConfigureOptions(fs *flag.FlagSet, args []string, printVersion, printHelp, printTLSHelp func()) (*Options, error) {
-	opts := &Options{}
-	var (
-		showVersion            bool
-		showHelp               bool
-		showTLSHelp            bool
-		signal                 string
-		configFile             string
-		dbgAndTrace            bool
-		trcAndVerboseTrc       bool
-		dbgAndTrcAndVerboseTrc bool
-		err                    error
-	)
-
-	fs.BoolVar(&showHelp, "h", false, "Show this message.")
-	fs.BoolVar(&showHelp, "help", false, "Show this message.")
-	fs.IntVar(&opts.Port, "port", 0, "Port to listen on.")
-	fs.IntVar(&opts.Port, "p", 0, "Port to listen on.")
-	fs.StringVar(&opts.Host, "addr", "", "Network host to listen on.")
-	fs.StringVar(&opts.Host, "a", "", "Network host to listen on.")
-	fs.StringVar(&opts.Host, "net", "", "Network host to listen on.")
-	fs.StringVar(&opts.ClientAdvertise, "client_advertise", "", "Client URL to advertise to other servers.")
-	fs.BoolVar(&opts.Debug, "D", false, "Enable Debug logging.")
-	fs.BoolVar(&opts.Debug, "debug", false, "Enable Debug logging.")
-	fs.BoolVar(&opts.Trace, "V", false, "Enable Trace logging.")
-	fs.BoolVar(&trcAndVerboseTrc, "VV", false, "Enable Verbose Trace logging. (Traces system account as well)")
-	fs.BoolVar(&opts.Trace, "trace", false, "Enable Trace logging.")
-	fs.BoolVar(&dbgAndTrace, "DV", false, "Enable Debug and Trace logging.")
-	fs.BoolVar(&dbgAndTrcAndVerboseTrc, "DVV", false, "Enable Debug and Verbose Trace logging. (Traces system account as well)")
-	fs.BoolVar(&opts.Logtime, "T", true, "Timestamp log entries.")
-	fs.BoolVar(&opts.Logtime, "logtime", true, "Timestamp log entries.")
-	fs.StringVar(&opts.Username, "user", "", "Username required for connection.")
-	fs.StringVar(&opts.Password, "pass", "", "Password required for connection.")
-	fs.StringVar(&opts.Authorization, "auth", "", "Authorization token required for connection.")
-	fs.IntVar(&opts.HTTPPort, "m", 0, "HTTP Port for /varz, /connz endpoints.")
-	fs.IntVar(&opts.HTTPPort, "http_port", 0, "HTTP Port for /varz, /connz endpoints.")
-	fs.IntVar(&opts.HTTPSPort, "ms", 0, "HTTPS Port for /varz, /connz endpoints.")
-	fs.IntVar(&opts.HTTPSPort, "https_port", 0, "HTTPS Port for /varz, /connz endpoints.")
-	fs.StringVar(&configFile, "c", "", "Configuration file.")
-	fs.StringVar(&configFile, "config", "", "Configuration file.")
-	fs.BoolVar(&opts.CheckConfig, "t", false, "Check configuration and exit.")
-	fs.StringVar(&signal, "sl", "", "Send signal to nats-server process (stop, quit, reopen, reload).")
-	fs.StringVar(&signal, "signal", "", "Send signal to nats-server process (stop, quit, reopen, reload).")
-	fs.StringVar(&opts.PidFile, "P", "", "File to store process pid.")
-	fs.StringVar(&opts.PidFile, "pid", "", "File to store process pid.")
-	fs.StringVar(&opts.PortsFileDir, "ports_file_dir", "", "Creates a ports file in the specified directory (<executable_name>_<pid>.ports).")
-	fs.StringVar(&opts.LogFile, "l", "", "File to store logging output.")
-	fs.StringVar(&opts.LogFile, "log", "", "File to store logging output.")
-	fs.Int64Var(&opts.LogSizeLimit, "log_size_limit", 0, "Logfile size limit being auto-rotated")
-	fs.BoolVar(&opts.Syslog, "s", false, "Enable syslog as log method.")
-	fs.BoolVar(&opts.Syslog, "syslog", false, "Enable syslog as log method.")
-	fs.StringVar(&opts.RemoteSyslog, "r", "", "Syslog server addr (udp://127.0.0.1:514).")
-	fs.StringVar(&opts.RemoteSyslog, "remote_syslog", "", "Syslog server addr (udp://127.0.0.1:514).")
-	fs.BoolVar(&showVersion, "version", false, "Print version information.")
-	fs.BoolVar(&showVersion, "v", false, "Print version information.")
-	fs.IntVar(&opts.ProfPort, "profile", 0, "Profiling HTTP port.")
-	fs.StringVar(&opts.RoutesStr, "routes", "", "Routes to actively solicit a connection.")
-	fs.StringVar(&opts.Cluster.ListenStr, "cluster", "", "Cluster url from which members can solicit routes.")
-	fs.StringVar(&opts.Cluster.ListenStr, "cluster_listen", "", "Cluster url from which members can solicit routes.")
-	fs.StringVar(&opts.Cluster.Advertise, "cluster_advertise", "", "Cluster URL to advertise to other servers.")
-	fs.BoolVar(&opts.Cluster.NoAdvertise, "no_advertise", false, "Advertise known cluster IPs to clients.")
-	fs.IntVar(&opts.Cluster.ConnectRetries, "connect_retries", 0, "For implicit routes, number of connect retries.")
-	fs.StringVar(&opts.Cluster.Name, "cluster_name", "", "Cluster Name, if not set one will be dynamically generated.")
-	fs.BoolVar(&showTLSHelp, "help_tls", false, "TLS help.")
-	fs.BoolVar(&opts.TLS, "tls", false, "Enable TLS.")
-	fs.BoolVar(&opts.TLSVerify, "tlsverify", false, "Enable TLS with client verification.")
-	fs.StringVar(&opts.TLSCert, "tlscert", "", "Server certificate file.")
-	fs.StringVar(&opts.TLSKey, "tlskey", "", "Private key for server certificate.")
-	fs.StringVar(&opts.TLSCaCert, "tlscacert", "", "Client certificate CA for verification.")
-	fs.IntVar(&opts.MaxTracedMsgLen, "max_traced_msg_len", 0, "Maximum printable length for traced messages. 0 for unlimited.")
-	fs.BoolVar(&opts.JetStream, "js", false, "Enable JetStream.")
-	fs.BoolVar(&opts.JetStream, "jetstream", false, "Enable JetStream.")
-	fs.StringVar(&opts.StoreDir, "sd", "", "Storage directory.")
-	fs.StringVar(&opts.StoreDir, "store_dir", "", "Storage directory.")
-
-	// The flags definition above set "default" values to some of the options.
-	// Calling Parse() here will override the default options with any value
-	// specified from the command line. This is ok. We will then update the
-	// options with the content of the configuration file (if present), and then,
-	// call Parse() again to override the default+config with command line values.
-	// Calling Parse() before processing config file is necessary since configFile
-	// itself is a command line argument, and also Parse() is required in order
-	// to know if user wants simply to show "help" or "version", etc...
-	if err := fs.Parse(args); err != nil {
-		return nil, err
-	}
-
-	if showVersion {
-		printVersion()
-		return nil, nil
-	}
-
-	if showHelp {
-		printHelp()
-		return nil, nil
-	}
-
-	if showTLSHelp {
-		printTLSHelp()
-		return nil, nil
-	}
-
-	// Process args looking for non-flag options,
-	// 'version' and 'help' only for now
-	showVersion, showHelp, err = ProcessCommandLineArgs(fs)
-	if err != nil {
-		return nil, err
-	} else if showVersion {
-		printVersion()
-		return nil, nil
-	} else if showHelp {
-		printHelp()
-		return nil, nil
-	}
-
-	// Snapshot flag options.
-	FlagSnapshot = opts.Clone()
-
-	// Keep track of the boolean flags that were explicitly set with their value.
-	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "DVV":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Debug", dbgAndTrcAndVerboseTrc)
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Trace", dbgAndTrcAndVerboseTrc)
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "TraceVerbose", dbgAndTrcAndVerboseTrc)
-		case "DV":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Debug", dbgAndTrace)
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Trace", dbgAndTrace)
-		case "D":
-			fallthrough
-		case "debug":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Debug", FlagSnapshot.Debug)
-		case "VV":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Trace", trcAndVerboseTrc)
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "TraceVerbose", trcAndVerboseTrc)
-		case "V":
-			fallthrough
-		case "trace":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Trace", FlagSnapshot.Trace)
-		case "T":
-			fallthrough
-		case "logtime":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Logtime", FlagSnapshot.Logtime)
-		case "s":
-			fallthrough
-		case "syslog":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Syslog", FlagSnapshot.Syslog)
-		case "no_advertise":
-			trackExplicitVal(FlagSnapshot, &FlagSnapshot.inCmdLine, "Cluster.NoAdvertise", FlagSnapshot.Cluster.NoAdvertise)
-		}
-	})
-
-	// Process signal control.
-	if signal != "" {
-		if err := processSignal(signal); err != nil {
-			return nil, err
-		}
-	}
-
-	// Parse config if given
-	if configFile != "" {
-		// This will update the options with values from the config file.
-		err := opts.ProcessConfigFile(configFile)
-		if err != nil {
-			if opts.CheckConfig {
-				return nil, err
-			}
-			if cerr, ok := err.(*processConfigErr); !ok || len(cerr.Errors()) != 0 {
-				return nil, err
-			}
-			// If we get here we only have warnings and can still continue
-			fmt.Fprint(os.Stderr, err)
-		} else if opts.CheckConfig {
-			// Report configuration file syntax test was successful and exit.
-			return opts, nil
-		}
-
-		// Call this again to override config file options with options from command line.
-		// Note: We don't need to check error here since if there was an error, it would
-		// have been caught the first time this function was called (after setting up the
-		// flags).
-		fs.Parse(args)
-	} else if opts.CheckConfig {
-		return nil, fmt.Errorf("must specify [-c, --config] option to check configuration file syntax")
-	}
-
-	// Special handling of some flags
-	var (
-		flagErr     error
-		tlsDisabled bool
-		tlsOverride bool
-	)
-	fs.Visit(func(f *flag.Flag) {
-		// short-circuit if an error was encountered
-		if flagErr != nil {
-			return
-		}
-		if strings.HasPrefix(f.Name, "tls") {
-			if f.Name == "tls" {
-				if !opts.TLS {
-					// User has specified "-tls=false", we need to disable TLS
-					opts.TLSConfig = nil
-					tlsDisabled = true
-					tlsOverride = false
-					return
-				}
-				tlsOverride = true
-			} else if !tlsDisabled {
-				tlsOverride = true
-			}
-		} else {
-			switch f.Name {
-			case "VV":
-				opts.Trace, opts.TraceVerbose = trcAndVerboseTrc, trcAndVerboseTrc
-			case "DVV":
-				opts.Trace, opts.Debug, opts.TraceVerbose = dbgAndTrcAndVerboseTrc, dbgAndTrcAndVerboseTrc, dbgAndTrcAndVerboseTrc
-			case "DV":
-				// Check value to support -DV=false
-				opts.Trace, opts.Debug = dbgAndTrace, dbgAndTrace
-			case "cluster", "cluster_listen":
-				// Override cluster config if explicitly set via flags.
-				flagErr = overrideCluster(opts)
-			case "routes":
-				// Keep in mind that the flag has updated opts.RoutesStr at this point.
-				if opts.RoutesStr == "" {
-					// Set routes array to nil since routes string is empty
-					opts.Routes = nil
-					return
-				}
-				routeUrls := RoutesFromStr(opts.RoutesStr)
-				opts.Routes = routeUrls
-			}
-		}
-	})
-	if flagErr != nil {
-		return nil, flagErr
-	}
-
-	// This will be true if some of the `-tls` params have been set and
-	// `-tls=false` has not been set.
-	if tlsOverride {
-		if err := overrideTLS(opts); err != nil {
-			return nil, err
-		}
-	}
-
-	// If we don't have cluster defined in the configuration
-	// file and no cluster listen string override, but we do
-	// have a routes override, we need to report misconfiguration.
-	if opts.RoutesStr != "" && opts.Cluster.ListenStr == "" && opts.Cluster.Host == "" && opts.Cluster.Port == 0 {
-		return nil, errors.New("solicited routes require cluster capabilities, e.g. --cluster")
-	}
-
-	return opts, nil
 }
 
 func normalizeBasePath(p string) string {
@@ -3875,77 +2653,14 @@ func normalizeBasePath(p string) string {
 	return path.Clean(p)
 }
 
-// overrideTLS is called when at least "-tls=true" has been set.
-func overrideTLS(opts *Options) error {
-	if opts.TLSCert == "" {
-		return errors.New("TLS Server certificate must be present and valid")
-	}
-	if opts.TLSKey == "" {
-		return errors.New("TLS Server private key must be present and valid")
-	}
-
-	tc := TLSConfigOpts{}
-	tc.CertFile = opts.TLSCert
-	tc.KeyFile = opts.TLSKey
-	tc.CaFile = opts.TLSCaCert
-	tc.Verify = opts.TLSVerify
-
-	var err error
-	opts.TLSConfig, err = GenTLSConfig(&tc)
-	return err
-}
-
 // overrideCluster updates Options.Cluster if that flag "cluster" (or "cluster_listen")
 // has explicitly be set in the command line. If it is set to empty string, it will
 // clear the Cluster options.
 func overrideCluster(opts *Options) error {
-	if opts.Cluster.ListenStr == "" {
+	if opts.Cluster.Name == "" {
 		// This one is enough to disable clustering.
-		opts.Cluster.Port = 0
 		return nil
 	}
-	// -1 will fail url.Parse, so if we have -1, change it to
-	// 0, and then after parse, replace the port with -1 so we get
-	// automatic port allocation
-	wantsRandom := false
-	if strings.HasSuffix(opts.Cluster.ListenStr, ":-1") {
-		wantsRandom = true
-		cls := fmt.Sprintf("%s:0", opts.Cluster.ListenStr[0:len(opts.Cluster.ListenStr)-3])
-		opts.Cluster.ListenStr = cls
-	}
-	clusterURL, err := url.Parse(opts.Cluster.ListenStr)
-	if err != nil {
-		return err
-	}
-	h, p, err := net.SplitHostPort(clusterURL.Host)
-	if err != nil {
-		return err
-	}
-	if wantsRandom {
-		p = "-1"
-	}
-	opts.Cluster.Host = h
-	_, err = fmt.Sscan(p, &opts.Cluster.Port)
-	if err != nil {
-		return err
-	}
-
-	if clusterURL.User != nil {
-		pass, hasPassword := clusterURL.User.Password()
-		if !hasPassword {
-			return errors.New("expected cluster password to be set")
-		}
-		opts.Cluster.Password = pass
-
-		user := clusterURL.User.Username()
-		opts.Cluster.Username = user
-	} else {
-		// Since we override from flag and there is no user/pwd, make
-		// sure we clear what we may have gotten from config file.
-		opts.Cluster.Username = ""
-		opts.Cluster.Password = ""
-	}
-
 	return nil
 }
 

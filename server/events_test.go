@@ -563,60 +563,6 @@ func TestSystemAccountDisconnectBadLogin(t *testing.T) {
 	}
 }
 
-func TestSysSubscribeRace(t *testing.T) {
-	s, opts := runTrustedServer(t)
-	defer s.Shutdown()
-
-	acc, akp := createAccount(s)
-	s.setSystemAccount(acc)
-
-	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
-
-	nc, err := nats.Connect(url, createUserCreds(t, s, akp))
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer nc.Close()
-
-	done := make(chan struct{})
-	wg := sync.WaitGroup{}
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for {
-			nc.Publish("foo", []byte("hello"))
-			select {
-			case <-done:
-				return
-			default:
-			}
-		}
-	}()
-
-	time.Sleep(10 * time.Millisecond)
-
-	received := make(chan struct{})
-	// Create message callback handler.
-	cb := func(sub *subscription, producer *client, subject, reply string, msg []byte) {
-		select {
-		case received <- struct{}{}:
-		default:
-		}
-	}
-	// Now create an internal subscription
-	sub, err := s.sysSubscribe("foo", cb)
-	if sub == nil || err != nil {
-		t.Fatalf("Expected to subscribe, got %v", err)
-	}
-	select {
-	case <-received:
-		close(done)
-	case <-time.After(time.Second):
-		t.Fatalf("Did not receive the message")
-	}
-	wg.Wait()
-}
-
 func TestSystemAccountInternalSubscriptions(t *testing.T) {
 	s, opts := runTrustedServer(t)
 	defer s.Shutdown()
@@ -1533,59 +1479,48 @@ func TestServerEventsPingStatsZ(t *testing.T) {
 	sa, _, sb, optsB, akp := runTrustedCluster(t)
 	defer sa.Shutdown()
 	defer sb.Shutdown()
+
 	url := fmt.Sprintf("nats://%s:%d", optsB.Host, optsB.Port)
 	nc, err := nats.Connect(url, createUserCreds(t, sb, akp))
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
 	defer nc.Close()
-	test := func(req []byte) {
-		reply := nc.NewRespInbox()
-		sub, _ := nc.SubscribeSync(reply)
-		nc.PublishRequest(serverStatsPingReqSubj, reply, req)
-		// Make sure its a statsz
-		m := ServerStatsMsg{}
-		// Receive both manually.
-		msg, err := sub.NextMsg(time.Second)
-		if err != nil {
-			t.Fatalf("Error receiving msg: %v", err)
-		}
-		if err := json.Unmarshal(msg.Data, &m); err != nil {
-			t.Fatalf("Error unmarshalling the statz json: %v", err)
-		}
-		msg, err = sub.NextMsg(time.Second)
-		if err != nil {
-			t.Fatalf("Error receiving msg: %v", err)
-		}
-		if err := json.Unmarshal(msg.Data, &m); err != nil {
-			t.Fatalf("Error unmarshalling the statz json: %v", err)
-		}
-	}
-	strRequestTbl := []string{
+
+	requestTbl := []string{
 		`{"cluster":"TEST"}`,
 		`{"cluster":"CLUSTER"}`,
-		`{"server_name":"SRV"}`,
-		`{"server_name":"_"}`,
+		`{"name":"SRV"}`,
+		`{"name":"_"}`,
 		fmt.Sprintf(`{"host":"%s"}`, optsB.Host),
 		fmt.Sprintf(`{"host":"%s", "cluster":"CLUSTER", "name":"SRV"}`, optsB.Host),
 	}
-	for i, opt := range strRequestTbl {
-		t.Run(fmt.Sprintf("%s-%d", t.Name(), i), func(t *testing.T) {
-			test([]byte(opt))
-		})
-	}
-	requestTbl := []StatszEventOptions{
-		{EventFilterOptions: EventFilterOptions{Cluster: "TEST"}},
-		{EventFilterOptions: EventFilterOptions{Cluster: "CLUSTER"}},
-		{EventFilterOptions: EventFilterOptions{Name: "SRV"}},
-		{EventFilterOptions: EventFilterOptions{Name: "_"}},
-		{EventFilterOptions: EventFilterOptions{Host: optsB.Host}},
-		{EventFilterOptions: EventFilterOptions{Host: optsB.Host, Cluster: "CLUSTER", Name: "SRV"}},
-	}
-	for i, opt := range requestTbl {
-		t.Run(fmt.Sprintf("%s-%d", t.Name(), i), func(t *testing.T) {
-			msg, _ := json.MarshalIndent(&opt, "", "  ")
-			test(msg)
+
+	for _, msg := range requestTbl {
+		t.Run(msg, func(t *testing.T) {
+			reply := nc.NewRespInbox()
+			sub, _ := nc.SubscribeSync(reply)
+
+			nc.PublishRequest(serverStatsPingReqSubj, reply, []byte(msg))
+
+			// Make sure its a statsz
+			m := ServerStatsMsg{}
+
+			// Receive both manually.
+			msg, err := sub.NextMsg(time.Second)
+			if err != nil {
+				t.Fatalf("Error receiving msg: %v", err)
+			}
+			if err := json.Unmarshal(msg.Data, &m); err != nil {
+				t.Fatalf("Error unmarshalling the statz json: %v", err)
+			}
+			msg, err = sub.NextMsg(time.Second)
+			if err != nil {
+				t.Fatalf("Error receiving msg: %v", err)
+			}
+			if err := json.Unmarshal(msg.Data, &m); err != nil {
+				t.Fatalf("Error unmarshalling the statz json: %v", err)
+			}
 		})
 	}
 }
@@ -1605,24 +1540,10 @@ func TestServerEventsPingStatsZFilter(t *testing.T) {
 	requestTbl := []string{
 		`{"cluster":"DOESNOTEXIST"}`,
 		`{"host":"DOESNOTEXIST"}`,
-		`{"server_name":"DOESNOTEXIST"}`,
+		`{"name":"DOESNOTEXIST"}`,
 	}
-	for i, msg := range requestTbl {
-		t.Run(fmt.Sprintf("%s-%d", t.Name(), i), func(t *testing.T) {
-			// Receive both manually.
-			if _, err := nc.Request(serverStatsPingReqSubj, []byte(msg), time.Second/4); err != nats.ErrTimeout {
-				t.Fatalf("Error, expected timeout: %v", err)
-			}
-		})
-	}
-	requestObjTbl := []EventFilterOptions{
-		{Cluster: "DOESNOTEXIST"},
-		{Host: "DOESNOTEXIST"},
-		{Name: "DOESNOTEXIST"},
-	}
-	for i, opt := range requestObjTbl {
-		t.Run(fmt.Sprintf("%s-%d", t.Name(), i), func(t *testing.T) {
-			msg, _ := json.MarshalIndent(&opt, "", "  ")
+	for _, msg := range requestTbl {
+		t.Run(msg, func(t *testing.T) {
 			// Receive both manually.
 			if _, err := nc.Request(serverStatsPingReqSubj, []byte(msg), time.Second/4); err != nats.ErrTimeout {
 				t.Fatalf("Error, expected timeout: %v", err)
@@ -1892,39 +1813,4 @@ func TestConnectionUpdatesTimerProperlySet(t *testing.T) {
 		}
 		return nil
 	})
-}
-
-func TestServerEventsReceivedByQSubs(t *testing.T) {
-	s, opts := runTrustedServer(t)
-	defer s.Shutdown()
-
-	acc, akp := createAccount(s)
-	s.setSystemAccount(acc)
-
-	url := fmt.Sprintf("nats://%s:%d", opts.Host, opts.Port)
-	ncs, err := nats.Connect(url, createUserCreds(t, s, akp))
-	if err != nil {
-		t.Fatalf("Error on connect: %v", err)
-	}
-	defer ncs.Close()
-
-	// Listen for auth error events.
-	qsub, _ := ncs.QueueSubscribeSync("$SYS.SERVER.*.CLIENT.AUTH.ERR", "queue")
-	defer qsub.Unsubscribe()
-
-	ncs.Flush()
-
-	nats.Connect(url, nats.Name("TEST BAD LOGIN"))
-
-	m, err := qsub.NextMsg(time.Second)
-	if err != nil {
-		t.Fatalf("Should have heard an auth error event")
-	}
-	dem := DisconnectEventMsg{}
-	if err := json.Unmarshal(m.Data, &dem); err != nil {
-		t.Fatalf("Error unmarshalling disconnect event message: %v", err)
-	}
-	if dem.Reason != "Authentication Failure" {
-		t.Fatalf("Expected auth error, got %q", dem.Reason)
-	}
 }

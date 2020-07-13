@@ -19,12 +19,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,18 +37,7 @@ import (
 var (
 	// This matches ./configs/nkeys_jwts/test.seed
 	oSeed = []byte("SOAFYNORQLQFJYBYNUGC5D7SH2MXMUX5BFEWWGHN3EK4VGG5TPT5DZP7QU")
-	// This matches ./configs/nkeys/op.jwt
-	ojwt = "eyJ0eXAiOiJqd3QiLCJhbGciOiJlZDI1NTE5In0.eyJhdWQiOiJURVNUUyIsImV4cCI6MTg1OTEyMTI3NSwianRpIjoiWE5MWjZYWVBIVE1ESlFSTlFPSFVPSlFHV0NVN01JNVc1SlhDWk5YQllVS0VRVzY3STI1USIsImlhdCI6MTU0Mzc2MTI3NSwiaXNzIjoiT0NBVDMzTVRWVTJWVU9JTUdOR1VOWEo2NkFIMlJMU0RBRjNNVUJDWUFZNVFNSUw2NU5RTTZYUUciLCJuYW1lIjoiU3luYWRpYSBDb21tdW5pY2F0aW9ucyBJbmMuIiwibmJmIjoxNTQzNzYxMjc1LCJzdWIiOiJPQ0FUMzNNVFZVMlZVT0lNR05HVU5YSjY2QUgyUkxTREFGM01VQkNZQVk1UU1JTDY1TlFNNlhRRyIsInR5cGUiOiJvcGVyYXRvciIsIm5hdHMiOnsic2lnbmluZ19rZXlzIjpbIk9EU0tSN01ZRlFaNU1NQUo2RlBNRUVUQ1RFM1JJSE9GTFRZUEpSTUFWVk40T0xWMllZQU1IQ0FDIiwiT0RTS0FDU1JCV1A1MzdEWkRSVko2NTdKT0lHT1BPUTZLRzdUNEhONk9LNEY2SUVDR1hEQUhOUDIiLCJPRFNLSTM2TFpCNDRPWTVJVkNSNlA1MkZaSlpZTVlXWlZXTlVEVExFWjVUSzJQTjNPRU1SVEFCUiJdfX0.hyfz6E39BMUh0GLzovFfk3wT4OfualftjdJ_eYkLfPvu5tZubYQ_Pn9oFYGCV_6yKy3KMGhWGUCyCdHaPhalBw"
-	oKp  nkeys.KeyPair
 )
-
-func init() {
-	var err error
-	oKp, err = nkeys.FromSeed(oSeed)
-	if err != nil {
-		panic(fmt.Sprintf("Parsing oSeed failed with: %v", err))
-	}
-}
 
 func opTrustBasicSetup() *Server {
 	kp, _ := nkeys.FromSeed(oSeed)
@@ -102,6 +89,8 @@ func createClientWithIssuer(t *testing.T, s *Server, akp nkeys.KeyPair, optIssue
 func setupJWTTestWithClaims(t *testing.T, nac *jwt.AccountClaims, nuc *jwt.UserClaims, expected string) (*Server, nkeys.KeyPair, *testAsyncClient, *bufio.Reader) {
 	t.Helper()
 
+	okp, _ := nkeys.FromSeed(oSeed)
+
 	akp, _ := nkeys.CreateAccount()
 	apub, _ := akp.PublicKey()
 	if nac == nil {
@@ -109,7 +98,7 @@ func setupJWTTestWithClaims(t *testing.T, nac *jwt.AccountClaims, nuc *jwt.UserC
 	} else {
 		nac.Subject = apub
 	}
-	ajwt, err := nac.Encode(oKp)
+	ajwt, err := nac.Encode(okp)
 	if err != nil {
 		t.Fatalf("Error generating account JWT: %v", err)
 	}
@@ -296,10 +285,7 @@ func TestJWTUserExpiresAfterConnect(t *testing.T) {
 	s, c, cr := setupJWTTestWithUserClaims(t, nuc, "+OK")
 	defer s.Shutdown()
 	defer c.close()
-	l, err := cr.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Received %v", err)
-	}
+	l, _ := cr.ReadString('\n')
 	if !strings.HasPrefix(l, "PONG") {
 		t.Fatalf("Expected a PONG")
 	}
@@ -307,10 +293,7 @@ func TestJWTUserExpiresAfterConnect(t *testing.T) {
 	// Now we should expire after 1 second or so.
 	time.Sleep(1250 * time.Millisecond)
 
-	l, err = cr.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Received %v", err)
-	}
+	l, _ = cr.ReadString('\n')
 	if !strings.HasPrefix(l, "-ERR ") {
 		t.Fatalf("Expected an error")
 	}
@@ -1575,14 +1558,13 @@ func TestAccountURLResolver(t *testing.T) {
 			defer ts.Close()
 
 			confTemplate := `
-				operator: %s
 				listen: -1
 				resolver: URL("%s/ngs/v1/accounts/jwt/")
 				resolver_tls {
 					insecure: true
 				}
 			`
-			conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, ojwt, ts.URL)))
+			conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, ts.URL)))
 			defer os.Remove(conf)
 
 			s, opts := RunServerWithConfig(conf)
@@ -1661,11 +1643,10 @@ func TestAccountURLResolverNoFetchOnReload(t *testing.T) {
 	defer ts.Close()
 
 	confTemplate := `
-		operator: %s
 		listen: -1
 		resolver: URL("%s/ngs/v1/accounts/jwt/")
     `
-	conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, ojwt, ts.URL)))
+	conf := createConfFile(t, []byte(fmt.Sprintf(confTemplate, ts.URL)))
 	defer os.Remove(conf)
 
 	s, _ := RunServerWithConfig(conf)
@@ -1687,7 +1668,7 @@ func TestAccountURLResolverNoFetchOnReload(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(confTemplate, ojwt, ts.URL)))
+	changeCurrentConfigContentWithNewContent(t, conf, []byte(fmt.Sprintf(confTemplate, ts.URL)))
 
 	if err := s.Reload(); err != nil {
 		t.Fatalf("Error on reload: %v", err)
@@ -1707,257 +1688,6 @@ func TestAccountURLResolverNoFetchOnReload(t *testing.T) {
 			s.Shutdown()
 		}
 		t.Fatalf("Expected error regarding account resolver, got %v", err)
-	}
-}
-
-func TestAccountURLResolverFetchFailureInCluster(t *testing.T) {
-	assertChanLen := func(x int, chans ...chan struct{}) {
-		t.Helper()
-		for _, c := range chans {
-			if len(c) != x {
-				t.Fatalf("length of channel is not %d", x)
-			}
-		}
-	}
-	const subj = ">"
-	const crossAccSubj = "test"
-	// Create Operator
-	op, _ := nkeys.CreateOperator()
-	opub, _ := op.PublicKey()
-	oc := jwt.NewOperatorClaims(opub)
-	oc.Subject = opub
-	ojwt, err := oc.Encode(op)
-	if err != nil {
-		t.Fatalf("Error generating operator JWT: %v", err)
-	}
-	// Create Exporting Account
-	expkp, _ := nkeys.CreateAccount()
-	exppub, _ := expkp.PublicKey()
-	expac := jwt.NewAccountClaims(exppub)
-	expac.Exports.Add(&jwt.Export{
-		Subject: crossAccSubj,
-		Type:    jwt.Stream,
-	})
-	expjwt, err := expac.Encode(op)
-	if err != nil {
-		t.Fatalf("Error generating account JWT: %v", err)
-	}
-	// Create importing Account
-	impkp, _ := nkeys.CreateAccount()
-	imppub, _ := impkp.PublicKey()
-	impac := jwt.NewAccountClaims(imppub)
-	impac.Imports.Add(&jwt.Import{
-		Account: exppub,
-		Subject: crossAccSubj,
-		Type:    jwt.Stream,
-	})
-	impac.Exports.Add(&jwt.Export{
-		Subject: "srvc",
-		Type:    jwt.Service,
-	})
-	impjwt, err := impac.Encode(op)
-	if err != nil {
-		t.Fatalf("Error generating account JWT: %v", err)
-	}
-	// Create User
-	nkp, _ := nkeys.CreateUser()
-	uSeed, _ := nkp.Seed()
-	upub, _ := nkp.PublicKey()
-	nuc := newJWTTestUserClaims()
-	nuc.Subject = upub
-	uJwt, err := nuc.Encode(impkp)
-	if err != nil {
-		t.Fatalf("Error generating user JWT: %v", err)
-	}
-	creds := genCredsFile(t, uJwt, uSeed)
-	defer os.Remove(creds)
-	// Simulate an account server that drops the first request to /B/acc
-	chanImpA := make(chan struct{}, 4)
-	defer close(chanImpA)
-	chanImpB := make(chan struct{}, 4)
-	defer close(chanImpB)
-	chanExpA := make(chan struct{}, 4)
-	defer close(chanExpA)
-	chanExpB := make(chan struct{}, 4)
-	defer close(chanExpB)
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/A/" {
-			// Server A startup
-			w.Write(nil)
-			chanImpA <- struct{}{}
-		} else if r.URL.Path == "/B/" {
-			// Server B startup
-			w.Write(nil)
-			chanImpB <- struct{}{}
-		} else if r.URL.Path == "/A/"+imppub {
-			// First Client connecting to Server A
-			w.Write([]byte(impjwt))
-			chanImpA <- struct{}{}
-		} else if r.URL.Path == "/B/"+imppub {
-			// Second Client connecting to Server B
-			w.Write([]byte(impjwt))
-			chanImpB <- struct{}{}
-		} else if r.URL.Path == "/A/"+exppub {
-			// First Client connecting to Server A
-			w.Write([]byte(expjwt))
-			chanExpA <- struct{}{}
-		} else if r.URL.Path == "/B/"+exppub {
-			// Second Client connecting to Server B
-			w.Write([]byte(expjwt))
-			chanExpB <- struct{}{}
-		} else {
-			t.Fatal("not expected")
-		}
-	}))
-	defer ts.Close()
-	// Create seed server A
-	confA := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		operator: %s
-		resolver: URL("%s/A/")
-		cluster {
-			name: clust
-			no_advertise: true
-			listen: -1
-		}
-    `, ojwt, ts.URL)))
-	defer os.Remove(confA)
-	sA := RunServer(LoadConfig(confA))
-	defer sA.Shutdown()
-	// Create Server B (using no_advertise to prevent failover)
-	confB := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		operator: %s
-		resolver: URL("%s/B/")
-		cluster {
-			name: clust
-			no_advertise: true
-			listen: -1 
-			routes [
-				nats-route://localhost:%d
-			]
-		}
-    `, ojwt, ts.URL, sA.opts.Cluster.Port)))
-	defer os.Remove(confB)
-	sB := RunServer(LoadConfig(confB))
-	defer sB.Shutdown()
-	// startup cluster
-	checkClusterFormed(t, sA, sB)
-	// Both server observed one fetch on startup
-	<-chanImpA
-	<-chanImpB
-	assertChanLen(0, chanImpA, chanImpB, chanExpA, chanExpB)
-	// Create first client, directly connects to A
-	urlA := fmt.Sprintf("nats://%s:%d", sA.opts.Host, sA.opts.Port)
-	ncA, err := nats.Connect(urlA, nats.UserCredentials(creds),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			if err != nil {
-				t.Fatal("error not expected in this test", err)
-			}
-		}),
-		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-			t.Fatal("error not expected in this test", err)
-		}),
-	)
-	if err != nil {
-		t.Fatalf("Expected to connect, got %v %s", err, urlA)
-	}
-	defer ncA.Close()
-	// create a test subscription
-	subA, err := ncA.SubscribeSync(subj)
-	if err != nil {
-		t.Fatalf("Expected no error during subscribe: %v", err)
-	}
-	defer subA.Unsubscribe()
-	// Connect of client triggered a fetch by Server A
-	<-chanImpA
-	<-chanExpA
-	assertChanLen(0, chanImpA, chanImpB, chanExpA, chanExpB)
-	//time.Sleep(10 * time.Second)
-	// create second client, directly connect to B
-	urlB := fmt.Sprintf("nats://%s:%d", sB.opts.Host, sB.opts.Port)
-	ncB, err := nats.Connect(urlB, nats.UserCredentials(creds), nats.NoReconnect())
-	if err != nil {
-		t.Fatalf("Expected to connect, got %v %s", err, urlB)
-	}
-	defer ncB.Close()
-	// Connect of client triggered a fetch by Server B
-	<-chanImpB
-	<-chanExpB
-	assertChanLen(0, chanImpA, chanImpB, chanExpA, chanExpB)
-	checkClusterFormed(t, sA, sB)
-	// the route subscription was lost due to the failed fetch
-	// Now we test if some recover mechanism is in play
-	checkSubInterest(t, sB, imppub, subj, 10*time.Second)         // Will fail as a result of this issue
-	checkSubInterest(t, sB, exppub, crossAccSubj, 10*time.Second) // Will fail as a result of this issue
-	if err := ncB.Publish(subj, []byte("msg")); err != nil {
-		t.Fatalf("Expected to publish %v", err)
-	}
-	// expect the message from B to flow to A
-	if m, err := subA.NextMsg(10 * time.Second); err != nil {
-		t.Fatalf("Expected to receive a message %v", err)
-	} else if string(m.Data) != "msg" {
-		t.Fatalf("Expected to receive 'msg', got: %s", string(m.Data))
-	}
-	assertChanLen(0, chanImpA, chanImpB, chanExpA, chanExpB)
-}
-
-func TestAccountURLResolverReturnDifferentOperator(t *testing.T) {
-	// Create a valid chain of op/acc/usr using a different operator
-	// This is so we can test if the server rejects this chain.
-	// Create Operator
-	op, _ := nkeys.CreateOperator()
-	// Create Account, this account is the one returned by the resolver
-	akp, _ := nkeys.CreateAccount()
-	apub, _ := akp.PublicKey()
-	nac := jwt.NewAccountClaims(apub)
-	ajwt, err := nac.Encode(op)
-	if err != nil {
-		t.Fatalf("Error generating account JWT: %v", err)
-	}
-	// Create User
-	nkp, _ := nkeys.CreateUser()
-	uSeed, _ := nkp.Seed()
-	upub, _ := nkp.PublicKey()
-	nuc := newJWTTestUserClaims()
-	nuc.Subject = upub
-	uJwt, err := nuc.Encode(akp)
-	if err != nil {
-		t.Fatalf("Error generating user JWT: %v", err)
-	}
-	creds := genCredsFile(t, uJwt, uSeed)
-	defer os.Remove(creds)
-	// Simulate an account server that was hijacked/mis configured
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(ajwt))
-	}))
-	defer ts.Close()
-	// Create Server
-	confA := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		operator: %s
-		resolver: URL("%s/A/")
-    `, ojwt, ts.URL)))
-	defer os.Remove(confA)
-	sA, _ := RunServerWithConfig(confA)
-	defer sA.Shutdown()
-	// Create first client, directly connects to A
-	urlA := fmt.Sprintf("nats://%s:%d", sA.opts.Host, sA.opts.Port)
-	if _, err := nats.Connect(urlA, nats.UserCredentials(creds),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			if err != nil {
-				t.Fatal("error not expected in this test", err)
-			}
-		}),
-		nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-			t.Fatal("error not expected in this test", err)
-		}),
-	); err == nil {
-		t.Fatal("Expected connect to fail")
-	}
-	// Test if the server has the account in memory. (shouldn't)
-	if v, ok := sA.accounts.Load(apub); ok {
-		t.Fatalf("Expected account to NOT be in memory: %v", v.(*Account))
 	}
 }
 
@@ -2882,559 +2612,4 @@ func TestExpiredUserCredentialsRenewal(t *testing.T) {
 	if nc.LastError() != nil {
 		t.Fatalf("Expected lastErr to be cleared, got %q", nc.LastError())
 	}
-}
-
-func TestAccountNATSResolverFetch(t *testing.T) {
-	require_NextMsg := func(sub *nats.Subscription) bool {
-		msg := natsNexMsg(t, sub, time.Second)
-		content := make(map[string]interface{})
-		json.Unmarshal(msg.Data, &content)
-		if _, ok := content["data"]; ok {
-			return true
-		}
-		return false
-	}
-	require_FileAbsent := func(dir string, pub string) {
-		t.Helper()
-		_, err := os.Stat(filepath.Join(dir, pub+".jwt"))
-		require_Error(t, err)
-		require_True(t, os.IsNotExist(err))
-	}
-	require_FilePresent := func(dir string, pub string) {
-		t.Helper()
-		_, err := os.Stat(filepath.Join(dir, pub+".jwt"))
-		require_NoError(t, err)
-	}
-	require_FileEqual := func(dir string, pub string, jwt string) {
-		t.Helper()
-		content, err := ioutil.ReadFile(filepath.Join(dir, pub+".jwt"))
-		require_NoError(t, err)
-		require_Equal(t, string(content), jwt)
-	}
-	require_1Connection := func(url string, creds string) {
-		t.Helper()
-		c := natsConnect(t, url, nats.UserCredentials(creds))
-		defer c.Close()
-		if _, err := nats.Connect(url, nats.UserCredentials(creds)); err == nil {
-			t.Fatal("Second connection was supposed to fail due to limits")
-		} else if !strings.Contains(err.Error(), ErrTooManyAccountConnections.Error()) {
-			t.Fatal("Second connection was supposed to fail with too many conns")
-		}
-	}
-	require_2Connection := func(url string, creds string) {
-		t.Helper()
-		c1 := natsConnect(t, url, nats.UserCredentials(creds))
-		defer c1.Close()
-		c2 := natsConnect(t, url, nats.UserCredentials(creds))
-		defer c2.Close()
-		if _, err := nats.Connect(url, nats.UserCredentials(creds)); err == nil {
-			t.Fatal("Third connection was supposed to fail due to limits")
-		} else if !strings.Contains(err.Error(), ErrTooManyAccountConnections.Error()) {
-			t.Fatal("Third connection was supposed to fail with too many conns")
-		}
-	}
-	writeFile := func(dir string, pub string, jwt string) {
-		t.Helper()
-		err := ioutil.WriteFile(filepath.Join(dir, pub+".jwt"), []byte(jwt), 0644)
-		require_NoError(t, err)
-	}
-	createDir := func(prefix string) string {
-		t.Helper()
-		dir, err := ioutil.TempDir("", prefix)
-		require_NoError(t, err)
-		return dir
-	}
-	connect := func(url string, credsfile string) {
-		t.Helper()
-		nc := natsConnect(t, url, nats.UserCredentials(credsfile))
-		nc.Close()
-	}
-	createAccountAndUser := func(limit bool, done chan struct{}, pubKey, jwt1, jwt2, creds *string) {
-		t.Helper()
-		kp, _ := nkeys.CreateAccount()
-		*pubKey, _ = kp.PublicKey()
-		claim := jwt.NewAccountClaims(*pubKey)
-		if limit {
-			claim.Limits.Conn = 1
-		}
-		var err error
-		*jwt1, err = claim.Encode(oKp)
-		require_NoError(t, err)
-		// need to assure that create time differs (resolution is sec)
-		time.Sleep(time.Millisecond * 1100)
-		// create updated claim allowing more connections
-		if limit {
-			claim.Limits.Conn = 2
-		}
-		*jwt2, err = claim.Encode(oKp)
-		require_NoError(t, err)
-		ukp, _ := nkeys.CreateUser()
-		seed, _ := ukp.Seed()
-		upub, _ := ukp.PublicKey()
-		uclaim := newJWTTestUserClaims()
-		uclaim.Subject = upub
-		ujwt, err := uclaim.Encode(kp)
-		require_NoError(t, err)
-		*creds = genCredsFile(t, ujwt, seed)
-		done <- struct{}{}
-	}
-	updateJwt := func(url string, creds string, pubKey string, jwt string) int {
-		t.Helper()
-		c := natsConnect(t, url, nats.UserCredentials(creds),
-			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-				if err != nil {
-					t.Fatal("error not expected in this test", err)
-				}
-			}),
-			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
-				t.Fatal("error not expected in this test", err)
-			}),
-		)
-		defer c.Close()
-		resp := c.NewRespInbox()
-		sub := natsSubSync(t, c, resp)
-		err := sub.AutoUnsubscribe(3)
-		require_NoError(t, err)
-		require_NoError(t, c.PublishRequest(fmt.Sprintf(accUpdateEventSubj, pubKey), resp, []byte(jwt)))
-		passCnt := 0
-		if require_NextMsg(sub) {
-			passCnt++
-		}
-		if require_NextMsg(sub) {
-			passCnt++
-		}
-		if require_NextMsg(sub) {
-			passCnt++
-		}
-		return passCnt
-	}
-	// Create Accounts and corresponding user creds. Do so concurrently to speed up the test
-	doneChan := make(chan struct{}, 5)
-	defer close(doneChan)
-	var syspub, sysjwt, dummy1, sysCreds string
-	go createAccountAndUser(false, doneChan, &syspub, &sysjwt, &dummy1, &sysCreds)
-	var apub, ajwt1, ajwt2, aCreds string
-	go createAccountAndUser(true, doneChan, &apub, &ajwt1, &ajwt2, &aCreds)
-	var bpub, bjwt1, bjwt2, bCreds string
-	go createAccountAndUser(true, doneChan, &bpub, &bjwt1, &bjwt2, &bCreds)
-	var cpub, cjwt1, cjwt2, cCreds string
-	go createAccountAndUser(true, doneChan, &cpub, &cjwt1, &cjwt2, &cCreds)
-	var dpub, djwt1, dummy2, dCreds string // extra user used later in the test in order to test limits
-	go createAccountAndUser(true, doneChan, &dpub, &djwt1, &dummy2, &dCreds)
-	<-doneChan
-	<-doneChan
-	<-doneChan
-	<-doneChan
-	<-doneChan
-	defer os.Remove(sysCreds)
-	defer os.Remove(aCreds)
-	defer os.Remove(bCreds)
-	defer os.Remove(cCreds)
-	defer os.Remove(dCreds)
-	// Create one directory for each server
-	dirA := createDir("srv-a")
-	defer os.RemoveAll(dirA)
-	dirB := createDir("srv-b")
-	defer os.RemoveAll(dirB)
-	dirC := createDir("srv-c")
-	defer os.RemoveAll(dirC)
-	// simulate a restart of the server by storing files in them
-	// Server A/B will completely sync, so after startup each server
-	// will contain the union off all stored/configured jwt
-	// Server C will send out lookup requests for jwt it does not store itself
-	writeFile(dirA, apub, ajwt1)
-	writeFile(dirB, bpub, bjwt1)
-	writeFile(dirC, cpub, cjwt1)
-	// Create seed server A (using no_advertise to prevent fail over)
-	confA := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		server_name: srv-A
-		operator: %s
-		system_account: %s
-		resolver: {
-			type: full
-			dir: %s
-			interval: "200ms"
-			limit: 4
-		}
-		resolver_preload: {
-			%s: %s
-		}
-		cluster {
-			name: clust
-			listen: -1
-			no_advertise: true
-		}
-    `, ojwt, syspub, dirA, cpub, cjwt1)))
-	defer os.Remove(confA)
-	sA, _ := RunServerWithConfig(confA)
-	defer sA.Shutdown()
-	// during startup resolver_preload causes the directory to contain data
-	require_FilePresent(dirA, cpub)
-	// Create Server B (using no_advertise to prevent fail over)
-	confB := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		server_name: srv-B
-		operator: %s
-		system_account: %s
-		resolver: {
-			type: full
-			dir: %s
-			interval: "200ms"
-			limit: 4
-		}
-		cluster {
-			name: clust
-			listen: -1 
-			no_advertise: true
-			routes [
-				nats-route://localhost:%d
-			]
-		}
-    `, ojwt, syspub, dirB, sA.opts.Cluster.Port)))
-	defer os.Remove(confB)
-	sB, _ := RunServerWithConfig(confB)
-	// Create Server C (using no_advertise to prevent fail over)
-	fmtC := `
-		listen: -1
-		server_name: srv-C
-		operator: %s
-		system_account: %s
-		resolver: {
-			type: cache
-			dir: %s
-			ttl: "%dms"
-			limit: 4
-		}
-		cluster {
-			name: clust
-			listen: -1 
-			no_advertise: true
-			routes [
-				nats-route://localhost:%d
-			]
-		}
-    `
-	confClongTTL := createConfFile(t, []byte(fmt.Sprintf(fmtC, ojwt, syspub, dirC, 10000, sA.opts.Cluster.Port)))
-	defer os.Remove(confClongTTL)
-	confCshortTTL := createConfFile(t, []byte(fmt.Sprintf(fmtC, ojwt, syspub, dirC, 1000, sA.opts.Cluster.Port)))
-	defer os.Remove(confCshortTTL)
-	sC, _ := RunServerWithConfig(confClongTTL) // use long ttl to assure it is not kicking
-	// startup cluster
-	checkClusterFormed(t, sA, sB, sC)
-	time.Sleep(500 * time.Millisecond) // wait for the protocol to converge
-	// Check all accounts
-	require_FilePresent(dirA, apub) // was already present on startup
-	require_FilePresent(dirB, apub) // was copied from server A
-	require_FileAbsent(dirC, apub)
-	require_FilePresent(dirA, bpub) // was copied from server B
-	require_FilePresent(dirB, bpub) // was already present on startup
-	require_FileAbsent(dirC, bpub)
-	require_FilePresent(dirA, cpub) // was present in preload
-	require_FilePresent(dirB, cpub) // was copied from server A
-	require_FilePresent(dirC, cpub) // was already present on startup
-	// This is to test that connecting to it still works
-	require_FileAbsent(dirA, syspub)
-	require_FileAbsent(dirB, syspub)
-	require_FileAbsent(dirC, syspub)
-	// system account client can connect to every server
-	connect(sA.ClientURL(), sysCreds)
-	connect(sB.ClientURL(), sysCreds)
-	connect(sC.ClientURL(), sysCreds)
-	checkClusterFormed(t, sA, sB, sC)
-	// upload system account and require a response from each server
-	passCnt := updateJwt(sA.ClientURL(), sysCreds, syspub, sysjwt)
-	require_True(t, passCnt == 3)
-	require_FilePresent(dirA, syspub) // was just received
-	require_FilePresent(dirB, syspub) // was just received
-	require_FilePresent(dirC, syspub) // was just received
-	// Only files missing are in C, which is only caching
-	connect(sC.ClientURL(), aCreds)
-	connect(sC.ClientURL(), bCreds)
-	require_FilePresent(dirC, apub) // was looked up form A or B
-	require_FilePresent(dirC, bpub) // was looked up from A or B
-
-	// Check limits and update jwt B connecting to server A
-	for port, v := range map[string]struct{ pub, jwt, creds string }{
-		sB.ClientURL(): {bpub, bjwt2, bCreds},
-		sC.ClientURL(): {cpub, cjwt2, cCreds},
-	} {
-		require_1Connection(sA.ClientURL(), v.creds)
-		require_1Connection(sB.ClientURL(), v.creds)
-		require_1Connection(sC.ClientURL(), v.creds)
-		checkClientsCount(t, sA, 0)
-		checkClientsCount(t, sB, 0)
-		checkClientsCount(t, sC, 0)
-		passCnt := updateJwt(port, sysCreds, v.pub, v.jwt)
-		require_True(t, passCnt == 3)
-		require_2Connection(sA.ClientURL(), v.creds)
-		require_2Connection(sB.ClientURL(), v.creds)
-		require_2Connection(sC.ClientURL(), v.creds)
-		require_FileEqual(dirA, v.pub, v.jwt)
-		require_FileEqual(dirB, v.pub, v.jwt)
-		require_FileEqual(dirC, v.pub, v.jwt)
-	}
-
-	// Simulates A having missed an update
-	// shutting B down as it has it will directly connect to A and connect right away
-	sB.Shutdown()
-	writeFile(dirB, apub, ajwt2) // this will be copied to server A
-	sB, _ = RunServerWithConfig(confB)
-	defer sB.Shutdown()
-	checkClusterFormed(t, sA, sB, sC)
-	time.Sleep(500 * time.Millisecond) // wait for the protocol to converge
-	// Restart server C. this is a workaround to force C to do a lookup in the absence of account cleanup
-	sC.Shutdown()
-	sC, _ = RunServerWithConfig(confClongTTL) //TODO remove this once we clean up accounts
-	require_FileEqual(dirA, apub, ajwt2)      // was copied from server B
-	require_FileEqual(dirB, apub, ajwt2)      // was restarted with this
-	require_FileEqual(dirC, apub, ajwt1)      // still contains old cached value
-	require_2Connection(sA.ClientURL(), aCreds)
-	require_2Connection(sB.ClientURL(), aCreds)
-	require_1Connection(sC.ClientURL(), aCreds)
-
-	// Restart server C. this is a workaround to force C to do a lookup in the absence of account cleanup
-	sC.Shutdown()
-	sC, _ = RunServerWithConfig(confCshortTTL) //TODO remove this once we clean up accounts
-	defer sC.Shutdown()
-	require_FileEqual(dirC, apub, ajwt1) // still contains old cached value
-	checkClusterFormed(t, sA, sB, sC)
-	// Force next connect to do a lookup exceeds ttl
-	fname := filepath.Join(dirC, apub+".jwt")
-	checkFor(t, 2*time.Second, 100*time.Millisecond, func() error {
-		_, err := os.Stat(fname)
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("File not removed in time")
-	})
-	connect(sC.ClientURL(), aCreds)      // When lookup happens
-	require_FileEqual(dirC, apub, ajwt2) // was looked up form A or B
-	require_2Connection(sC.ClientURL(), aCreds)
-
-	// Test exceeding limit. For the exclusive directory resolver, limit is a stop gap measure.
-	// It is not expected to be hit. When hit the administrator is supposed to take action.
-	passCnt = updateJwt(sA.ClientURL(), sysCreds, dpub, djwt1)
-	require_True(t, passCnt == 1) // Only Server C updated
-}
-
-func newTimeRange(start time.Time, dur time.Duration) jwt.TimeRange {
-	return jwt.TimeRange{Start: start.Format("15:04:05"), End: start.Add(dur).Format("15:04:05")}
-}
-
-func createUserWithLimit(t *testing.T, accKp nkeys.KeyPair, expiration time.Time, limits func(*jwt.Limits)) string {
-	t.Helper()
-	ukp, _ := nkeys.CreateUser()
-	seed, _ := ukp.Seed()
-	upub, _ := ukp.PublicKey()
-	uclaim := newJWTTestUserClaims()
-	uclaim.Subject = upub
-	if limits != nil {
-		limits(&uclaim.Limits)
-	}
-	if !expiration.IsZero() {
-		uclaim.Expires = expiration.Unix()
-	}
-	vr := jwt.ValidationResults{}
-	uclaim.Validate(&vr)
-	require_Len(t, len(vr.Errors()), 0)
-	ujwt, err := uclaim.Encode(accKp)
-	require_NoError(t, err)
-	return genCredsFile(t, ujwt, seed)
-}
-
-func TestJWTUserLimits(t *testing.T) {
-	// helper for time
-	inAnHour := time.Now().Add(time.Hour)
-	inTwoHours := time.Now().Add(2 * time.Hour)
-	doNotExpire := time.Now().AddDate(1, 0, 0)
-	// create account
-	kp, _ := nkeys.CreateAccount()
-	aPub, _ := kp.PublicKey()
-	claim := jwt.NewAccountClaims(aPub)
-	aJwt, err := claim.Encode(oKp)
-	require_NoError(t, err)
-	conf := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		operator: %s
-		resolver: MEM
-		resolver_preload: {
-			%s: %s
-		}
-    `, ojwt, aPub, aJwt)))
-	defer os.Remove(conf)
-	sA, _ := RunServerWithConfig(conf)
-	defer sA.Shutdown()
-	for _, v := range []struct {
-		pass bool
-		f    func(*jwt.Limits)
-	}{
-		{true, nil},
-		{false, func(j *jwt.Limits) { j.Src = "8.8.8.8/8" }},
-		{true, func(j *jwt.Limits) { j.Src = "8.8.8.8/0" }},
-		{true, func(j *jwt.Limits) { j.Src = "127.0.0.1/8" }},
-		{true, func(j *jwt.Limits) { j.Src = "8.8.8.8/8,127.0.0.1/8" }},
-		{false, func(j *jwt.Limits) { j.Src = "8.8.8.8/8,9.9.9.9/8" }},
-		{true, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now(), time.Hour)) }},
-		{false, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now().Add(time.Hour), time.Hour)) }},
-		{true, func(j *jwt.Limits) {
-			j.Times = append(j.Times, newTimeRange(inAnHour, time.Hour), newTimeRange(time.Now(), time.Hour))
-		}}, // last one is within range
-		{false, func(j *jwt.Limits) {
-			j.Times = append(j.Times, newTimeRange(inAnHour, time.Hour), newTimeRange(inTwoHours, time.Hour))
-		}}, // out of range
-		{false, func(j *jwt.Limits) {
-			j.Times = append(j.Times, newTimeRange(inAnHour, 3*time.Hour), newTimeRange(inTwoHours, 2*time.Hour))
-		}}, // overlapping [a[]b] out of range*/
-		{false, func(j *jwt.Limits) {
-			j.Times = append(j.Times, newTimeRange(inAnHour, 3*time.Hour), newTimeRange(inTwoHours, time.Hour))
-		}}, // overlapping [a[b]] out of range
-		// next day tests where end < begin
-		{true, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now(), 25*time.Hour)) }},
-		{true, func(j *jwt.Limits) { j.Times = append(j.Times, newTimeRange(time.Now(), -time.Hour)) }},
-	} {
-		t.Run("", func(t *testing.T) {
-			creds := createUserWithLimit(t, kp, doNotExpire, v.f)
-			defer os.Remove(creds)
-			if c, err := nats.Connect(sA.ClientURL(), nats.UserCredentials(creds)); err == nil {
-				c.Close()
-				if !v.pass {
-					t.Fatalf("Expected failure got none")
-				}
-			} else if v.pass {
-				t.Fatalf("Expected success got %v", err)
-			} else if !strings.Contains(err.Error(), "Authorization Violation") {
-				t.Fatalf("Expected error other than %v", err)
-			}
-		})
-	}
-}
-
-func TestJWTTimeExpiration(t *testing.T) {
-	validFor := 1500 * time.Millisecond
-	validRange := 500 * time.Millisecond
-	doNotExpire := time.Now().AddDate(1, 0, 0)
-	// create account
-	kp, _ := nkeys.CreateAccount()
-	aPub, _ := kp.PublicKey()
-	claim := jwt.NewAccountClaims(aPub)
-	aJwt, err := claim.Encode(oKp)
-	require_NoError(t, err)
-	conf := createConfFile(t, []byte(fmt.Sprintf(`
-		listen: -1
-		operator: %s
-		resolver: MEM
-		resolver_preload: {
-			%s: %s
-		}
-    `, ojwt, aPub, aJwt)))
-	defer os.Remove(conf)
-	sA, _ := RunServerWithConfig(conf)
-	defer sA.Shutdown()
-	t.Run("simple expiration", func(t *testing.T) {
-		start := time.Now()
-		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.Limits) { j.Times = []jwt.TimeRange{newTimeRange(start, validFor)} })
-		defer os.Remove(creds)
-		disconnectChan := make(chan struct{})
-		defer close(disconnectChan)
-		errChan := make(chan struct{})
-		defer close(errChan)
-		c := natsConnect(t, sA.ClientURL(),
-			nats.UserCredentials(creds),
-			nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
-				if err != io.EOF {
-					return
-				}
-				disconnectChan <- struct{}{}
-			}),
-			nats.ErrorHandler(func(conn *nats.Conn, s *nats.Subscription, err error) {
-				if err != nats.ErrAuthExpired {
-					return
-				}
-				now := time.Now()
-				stop := start.Add(validFor)
-				// assure event happens within a second of stop
-				if stop.Add(-validRange).Before(stop) && now.Before(stop.Add(validRange)) {
-					errChan <- struct{}{}
-				}
-			}))
-		<-errChan
-		<-disconnectChan
-		require_True(t, c.IsReconnecting())
-		require_False(t, c.IsConnected())
-		c.Close()
-	})
-	t.Run("double expiration", func(t *testing.T) {
-		start1 := time.Now()
-		start2 := start1.Add(2 * validFor)
-		creds := createUserWithLimit(t, kp, doNotExpire, func(j *jwt.Limits) {
-			j.Times = []jwt.TimeRange{newTimeRange(start1, validFor), newTimeRange(start2, validFor)}
-		})
-		defer os.Remove(creds)
-		errChan := make(chan struct{})
-		defer close(errChan)
-		reConnectChan := make(chan struct{})
-		defer close(reConnectChan)
-		c := natsConnect(t, sA.ClientURL(),
-			nats.UserCredentials(creds),
-			nats.ReconnectHandler(func(conn *nats.Conn) {
-				reConnectChan <- struct{}{}
-			}),
-			nats.ErrorHandler(func(conn *nats.Conn, s *nats.Subscription, err error) {
-				if err != nats.ErrAuthExpired {
-					return
-				}
-				now := time.Now()
-				stop := start1.Add(validFor)
-				// assure event happens within a second of stop
-				if stop.Add(-validRange).Before(stop) && now.Before(stop.Add(validRange)) {
-					errChan <- struct{}{}
-					return
-				}
-				stop = start2.Add(validFor)
-				// assure event happens within a second of stop
-				if stop.Add(-validRange).Before(stop) && now.Before(stop.Add(validRange)) {
-					errChan <- struct{}{}
-				}
-			}))
-		<-errChan
-		<-reConnectChan
-		require_False(t, c.IsReconnecting())
-		require_True(t, c.IsConnected())
-		<-errChan
-		c.Close()
-	})
-	t.Run("lower jwt expiration overwrites time", func(t *testing.T) {
-		start := time.Now()
-		creds := createUserWithLimit(t, kp, start.Add(validFor), func(j *jwt.Limits) { j.Times = []jwt.TimeRange{newTimeRange(start, 2*validFor)} })
-		defer os.Remove(creds)
-		disconnectChan := make(chan struct{})
-		defer close(disconnectChan)
-		errChan := make(chan struct{})
-		defer close(errChan)
-		c := natsConnect(t, sA.ClientURL(),
-			nats.UserCredentials(creds),
-			nats.DisconnectErrHandler(func(conn *nats.Conn, err error) {
-				if err != io.EOF {
-					return
-				}
-				disconnectChan <- struct{}{}
-			}),
-			nats.ErrorHandler(func(conn *nats.Conn, s *nats.Subscription, err error) {
-				if err != nats.ErrAuthExpired {
-					return
-				}
-				now := time.Now()
-				stop := start.Add(validFor)
-				// assure event happens within a second of stop
-				if stop.Add(-validRange).Before(stop) && now.Before(stop.Add(validRange)) {
-					errChan <- struct{}{}
-				}
-			}))
-		<-errChan
-		<-disconnectChan
-		require_True(t, c.IsReconnecting())
-		require_False(t, c.IsConnected())
-		c.Close()
-	})
 }

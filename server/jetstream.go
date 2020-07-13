@@ -773,11 +773,11 @@ func (jsa *jsAccount) limitsExceeded(storeType StorageType) bool {
 	var exceeded bool
 	jsa.mu.Lock()
 	if storeType == MemoryStorage {
-		if jsa.limits.MaxMemory > 0 && jsa.memUsed > jsa.limits.MaxMemory {
+		if jsa.memUsed > jsa.limits.MaxMemory {
 			exceeded = true
 		}
 	} else {
-		if jsa.limits.MaxStore > 0 && jsa.storeUsed > jsa.limits.MaxStore {
+		if jsa.storeUsed > jsa.limits.MaxStore {
 			exceeded = true
 		}
 	}
@@ -796,10 +796,11 @@ func (jsa *jsAccount) checkLimits(config *StreamConfig) error {
 		return fmt.Errorf("replicas setting of %d not allowed", config.Replicas)
 	}
 	// Check MaxConsumers
-	if config.MaxConsumers > 0 && jsa.limits.MaxConsumers > 0 && config.MaxConsumers > jsa.limits.MaxConsumers {
+	if config.MaxConsumers > 0 && config.MaxConsumers > jsa.limits.MaxConsumers {
 		return fmt.Errorf("maximum consumers exceeds account limit")
+	} else {
+		config.MaxConsumers = jsa.limits.MaxConsumers
 	}
-
 	// Check storage, memory or disk.
 	if config.MaxBytes > 0 {
 		return jsa.checkBytesLimits(config.MaxBytes*int64(config.Replicas), config.Storage)
@@ -1056,10 +1057,14 @@ func (t *StreamTemplate) createTemplateSubscriptions() error {
 	sid := 1
 	for _, subject := range t.Config.Subjects {
 		// Now create the subscription
-		if _, err := c.processSub([]byte(subject), nil, []byte(strconv.Itoa(sid)), t.processInboundTemplateMsg, false); err != nil {
+		sub, err := c.processSub([]byte(subject+" "+strconv.Itoa(sid)), false)
+		if err != nil {
 			c.acc.DeleteStreamTemplate(t.Name)
 			return err
 		}
+		c.mu.Lock()
+		sub.icb = t.processInboundTemplateMsg
+		c.mu.Unlock()
 		sid++
 	}
 	return nil

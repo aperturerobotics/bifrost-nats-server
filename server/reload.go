@@ -146,73 +146,6 @@ func (l *logtimeOption) Apply(server *Server) {
 	server.Noticef("Reloaded: logtime = %v", l.newValue)
 }
 
-// logfileOption implements the option interface for the `log_file` setting.
-type logfileOption struct {
-	loggingOption
-	newValue string
-}
-
-// Apply is a no-op because logging will be reloaded after options are applied.
-func (l *logfileOption) Apply(server *Server) {
-	server.Noticef("Reloaded: log_file = %v", l.newValue)
-}
-
-// syslogOption implements the option interface for the `syslog` setting.
-type syslogOption struct {
-	loggingOption
-	newValue bool
-}
-
-// Apply is a no-op because logging will be reloaded after options are applied.
-func (s *syslogOption) Apply(server *Server) {
-	server.Noticef("Reloaded: syslog = %v", s.newValue)
-}
-
-// remoteSyslogOption implements the option interface for the `remote_syslog`
-// setting.
-type remoteSyslogOption struct {
-	loggingOption
-	newValue string
-}
-
-// Apply is a no-op because logging will be reloaded after options are applied.
-func (r *remoteSyslogOption) Apply(server *Server) {
-	server.Noticef("Reloaded: remote_syslog = %v", r.newValue)
-}
-
-// tlsOption implements the option interface for the `tls` setting.
-type tlsOption struct {
-	noopOption
-	newValue *tls.Config
-}
-
-// Apply the tls change.
-func (t *tlsOption) Apply(server *Server) {
-	server.mu.Lock()
-	tlsRequired := t.newValue != nil
-	server.info.TLSRequired = tlsRequired
-	message := "disabled"
-	if tlsRequired {
-		server.info.TLSVerify = (t.newValue.ClientAuth == tls.RequireAndVerifyClientCert)
-		message = "enabled"
-	}
-	server.mu.Unlock()
-	server.Noticef("Reloaded: tls = %s", message)
-}
-
-// tlsTimeoutOption implements the option interface for the tls `timeout`
-// setting.
-type tlsTimeoutOption struct {
-	noopOption
-	newValue float64
-}
-
-// Apply is a no-op because the timeout will be reloaded after options are
-// applied.
-func (t *tlsTimeoutOption) Apply(server *Server) {
-	server.Noticef("Reloaded: tls timeout = %v", t.newValue)
-}
-
 // authOption is a base struct that provides default option behaviors.
 type authOption struct {
 	noopOption
@@ -300,26 +233,12 @@ type clusterOption struct {
 func (c *clusterOption) Apply(s *Server) {
 	// TODO: support enabling/disabling clustering.
 	s.mu.Lock()
-	tlsRequired := c.newValue.TLSConfig != nil
-	s.routeInfo.TLSRequired = tlsRequired
-	s.routeInfo.TLSVerify = tlsRequired
 	s.routeInfo.AuthRequired = c.newValue.Username != ""
-	if c.newValue.NoAdvertise {
-		s.routeInfo.ClientConnectURLs = nil
-		s.routeInfo.WSConnectURLs = nil
-	} else {
-		s.routeInfo.ClientConnectURLs = s.clientConnectURLs
-		s.routeInfo.WSConnectURLs = s.websocket.connectURLs
-	}
-	s.setRouteInfoHostPortAndIP()
 	s.mu.Unlock()
 	if c.newValue.Name != "" && c.newValue.Name != s.ClusterName() {
 		s.setClusterName(c.newValue.Name)
 	}
 	s.Noticef("Reloaded: cluster")
-	if tlsRequired && c.newValue.TLSConfig.InsecureSkipVerify {
-		s.Warnf(clusterTLSInsecureWarning)
-	}
 }
 
 func (c *clusterOption) IsClusterPermsChange() bool {
@@ -330,8 +249,8 @@ func (c *clusterOption) IsClusterPermsChange() bool {
 // setting.
 type routesOption struct {
 	noopOption
-	add    []*url.URL
-	remove []*url.URL
+	add    []string
+	remove []string
 }
 
 // Apply the route changes by adding and removing the necessary routes.
@@ -353,13 +272,13 @@ func (r *routesOption) Apply(server *Server) {
 	// Remove routes.
 	for _, remove := range r.remove {
 		for _, client := range routes {
-			var url *url.URL
+			var name string
 			client.mu.Lock()
 			if client.route != nil {
-				url = client.route.url
+				name = client.route.remoteName
 			}
 			client.mu.Unlock()
-			if url != nil && urlsAreEqual(url, remove) {
+			if name != "" && strings.EqualFold(name, remove) {
 				// Do not attempt to reconnect when route is removed.
 				client.setNoReconnect()
 				client.closeConnection(RouteRemoved)
@@ -628,12 +547,6 @@ func (s *Server) Reload() error {
 		curOpts.TrustedKeys = nil
 	}
 
-	clientOrgPort := curOpts.Port
-	clusterOrgPort := curOpts.Cluster.Port
-	gatewayOrgPort := curOpts.Gateway.Port
-	leafnodesOrgPort := curOpts.LeafNode.Port
-	websocketOrgPort := curOpts.Websocket.Port
-
 	s.mu.Unlock()
 
 	// Apply flags over config file settings.
@@ -645,26 +558,6 @@ func (s *Server) Reload() error {
 	}
 
 	setBaselineOptions(newOpts)
-
-	// setBaselineOptions sets Port to 0 if set to -1 (RANDOM port)
-	// If that's the case, set it to the saved value when the accept loop was
-	// created.
-	if newOpts.Port == 0 {
-		newOpts.Port = clientOrgPort
-	}
-	// We don't do that for cluster, so check against -1.
-	if newOpts.Cluster.Port == -1 {
-		newOpts.Cluster.Port = clusterOrgPort
-	}
-	if newOpts.Gateway.Port == -1 {
-		newOpts.Gateway.Port = gatewayOrgPort
-	}
-	if newOpts.LeafNode.Port == -1 {
-		newOpts.LeafNode.Port = leafnodesOrgPort
-	}
-	if newOpts.Websocket.Port == -1 {
-		newOpts.Websocket.Port = websocketOrgPort
-	}
 
 	if err := s.reloadOptions(curOpts, newOpts); err != nil {
 		return err
@@ -765,12 +658,8 @@ func imposeOrder(value interface{}) error {
 		sort.Slice(value.Gateways, func(i, j int) bool {
 			return value.Gateways[i].Name < value.Gateways[j].Name
 		})
-	case WebsocketOpts:
-		sort.Slice(value.AllowedOrigins, func(i, j int) bool {
-			return value.AllowedOrigins[i] < value.AllowedOrigins[j]
-		})
 	case string, bool, int, int32, int64, time.Duration, float64, nil,
-		LeafNodeOpts, ClusterOpts, *tls.Config, *URLAccResolver, *MemAccResolver, *DirAccResolver, *CacheDirAccResolver, Authentication:
+		LeafNodeOpts, ClusterOpts, *tls.Config, *URLAccResolver, *MemAccResolver, Authentication:
 		// explicitly skipped types
 	default:
 		// this will fail during unit tests
@@ -818,16 +707,6 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			diffOpts = append(diffOpts, &debugOption{newValue: newValue.(bool)})
 		case "logtime":
 			diffOpts = append(diffOpts, &logtimeOption{newValue: newValue.(bool)})
-		case "logfile":
-			diffOpts = append(diffOpts, &logfileOption{newValue: newValue.(string)})
-		case "syslog":
-			diffOpts = append(diffOpts, &syslogOption{newValue: newValue.(bool)})
-		case "remotesyslog":
-			diffOpts = append(diffOpts, &remoteSyslogOption{newValue: newValue.(string)})
-		case "tlsconfig":
-			diffOpts = append(diffOpts, &tlsOption{newValue: newValue.(*tls.Config)})
-		case "tlstimeout":
-			diffOpts = append(diffOpts, &tlsTimeoutOption{newValue: newValue.(float64)})
 		case "username":
 			diffOpts = append(diffOpts, &usernameOption{})
 		case "password":
@@ -848,9 +727,6 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			}
 			permsChanged := !reflect.DeepEqual(newClusterOpts.Permissions, oldClusterOpts.Permissions)
 			diffOpts = append(diffOpts, &clusterOption{newValue: newClusterOpts, permsChanged: permsChanged})
-		case "routes":
-			add, remove := diffRoutes(oldValue.([]*url.URL), newValue.([]*url.URL))
-			diffOpts = append(diffOpts, &routesOption{add: add, remove: remove})
 		case "maxconn":
 			diffOpts = append(diffOpts, &maxConnOption{newValue: newValue.(int)})
 		case "pidfile":
@@ -895,8 +771,6 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// remove for the test.
 			tmpOld := oldValue.(GatewayOpts)
 			tmpNew := newValue.(GatewayOpts)
-			tmpOld.TLSConfig = nil
-			tmpNew.TLSConfig = nil
 			// If there is really a change prevents reload.
 			if !reflect.DeepEqual(tmpOld, tmpNew) {
 				// See TODO(ik) note below about printing old/new values.
@@ -907,8 +781,6 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			// Similar to gateways
 			tmpOld := oldValue.(LeafNodeOpts)
 			tmpNew := newValue.(LeafNodeOpts)
-			tmpOld.TLSConfig = nil
-			tmpNew.TLSConfig = nil
 
 			// Special check for leafnode remotes changes which are not supported right now.
 			leafRemotesChanged := func(a, b LeafNodeOpts) bool {
@@ -965,18 +837,6 @@ func (s *Server) diffOptions(newOpts *Options) ([]option, error) {
 			return nil, fmt.Errorf("config reload not supported for jetstream max memory")
 		case "jetstreammaxstore":
 			return nil, fmt.Errorf("config reload not supported for jetstream max storage")
-		case "websocket":
-			// Similar to gateways
-			tmpOld := oldValue.(WebsocketOpts)
-			tmpNew := newValue.(WebsocketOpts)
-			tmpOld.TLSConfig = nil
-			tmpNew.TLSConfig = nil
-			// If there is really a change prevents reload.
-			if !reflect.DeepEqual(tmpOld, tmpNew) {
-				// See TODO(ik) note below about printing old/new values.
-				return nil, fmt.Errorf("config reload not supported for %s: old=%v, new=%v",
-					field.Name, oldValue, newValue)
-			}
 		case "connecterrorreports":
 			diffOpts = append(diffOpts, &connectErrorReports{newValue: newValue.(int)})
 		case "reconnecterrorreports":
@@ -1276,9 +1136,11 @@ func (s *Server) reloadAuthorization() {
 		s.configAllJetStreamAccounts()
 	}
 
-	if res := s.AccountResolver(); res != nil {
-		res.Reload()
-	}
+	/*
+		if res := s.AccountResolver(); res != nil {
+			res.Reload()
+		}
+	*/
 }
 
 // Returns true if given client current account has changed (or user
@@ -1437,47 +1299,5 @@ func (s *Server) reloadClusterPermissions(oldPerms *RoutePermissions) {
 // validateClusterOpts ensures the new ClusterOpts does not change host or
 // port, which do not support reload.
 func validateClusterOpts(old, new ClusterOpts) error {
-	if old.Host != new.Host {
-		return fmt.Errorf("config reload not supported for cluster host: old=%s, new=%s",
-			old.Host, new.Host)
-	}
-	if old.Port != new.Port {
-		return fmt.Errorf("config reload not supported for cluster port: old=%d, new=%d",
-			old.Port, new.Port)
-	}
-	// Validate Cluster.Advertise syntax
-	if new.Advertise != "" {
-		if _, _, err := parseHostPort(new.Advertise, 0); err != nil {
-			return fmt.Errorf("invalid Cluster.Advertise value of %s, err=%v", new.Advertise, err)
-		}
-	}
 	return nil
-}
-
-// diffRoutes diffs the old routes and the new routes and returns the ones that
-// should be added and removed from the server.
-func diffRoutes(old, new []*url.URL) (add, remove []*url.URL) {
-	// Find routes to remove.
-removeLoop:
-	for _, oldRoute := range old {
-		for _, newRoute := range new {
-			if urlsAreEqual(oldRoute, newRoute) {
-				continue removeLoop
-			}
-		}
-		remove = append(remove, oldRoute)
-	}
-
-	// Find routes to add.
-addLoop:
-	for _, newRoute := range new {
-		for _, oldRoute := range old {
-			if urlsAreEqual(oldRoute, newRoute) {
-				continue addLoop
-			}
-		}
-		add = append(add, newRoute)
-	}
-
-	return add, remove
 }

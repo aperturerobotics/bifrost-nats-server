@@ -395,51 +395,6 @@ func TestClientAdvertiseConnectURL(t *testing.T) {
 	s.Shutdown()
 }
 
-func TestClientAdvertiseInCluster(t *testing.T) {
-	optsA := DefaultOptions()
-	optsA.ClientAdvertise = "srvA:4222"
-	srvA := RunServer(optsA)
-	defer srvA.Shutdown()
-
-	nc := natsConnect(t, srvA.ClientURL())
-	defer nc.Close()
-
-	optsB := DefaultOptions()
-	optsB.ClientAdvertise = "srvBC:4222"
-	optsB.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", optsA.Cluster.Port))
-	srvB := RunServer(optsB)
-	defer srvB.Shutdown()
-
-	checkClusterFormed(t, srvA, srvB)
-
-	checkURLs := func(expected string) {
-		t.Helper()
-		checkFor(t, time.Second, 15*time.Millisecond, func() error {
-			srvs := nc.DiscoveredServers()
-			for _, u := range srvs {
-				if u == expected {
-					return nil
-				}
-			}
-			return fmt.Errorf("Url %q not found in %q", expected, srvs)
-		})
-	}
-	checkURLs("nats://srvBC:4222")
-
-	optsC := DefaultOptions()
-	optsC.ClientAdvertise = "srvBC:4222"
-	optsC.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", optsA.Cluster.Port))
-	srvC := RunServer(optsC)
-	defer srvC.Shutdown()
-
-	checkClusterFormed(t, srvA, srvB, srvC)
-	checkURLs("nats://srvBC:4222")
-
-	srvB.Shutdown()
-	checkNumRoutes(t, srvA, 1)
-	checkURLs("nats://srvBC:4222")
-}
-
 func TestClientAdvertiseErrorOnStartup(t *testing.T) {
 	opts := DefaultOptions()
 	// Set invalid address
@@ -1229,6 +1184,9 @@ func TestAcceptError(t *testing.T) {
 }
 
 func TestAcceptLoopsDoNotLeaveOpenedConn(t *testing.T) {
+	testWebsocketAllowNonTLS = true
+	defer func() { testWebsocketAllowNonTLS = false }()
+
 	for _, test := range []struct {
 		name string
 		url  func(o *Options) (string, int)
@@ -1255,7 +1213,6 @@ func TestAcceptLoopsDoNotLeaveOpenedConn(t *testing.T) {
 			o.Websocket.Host = "127.0.0.1"
 			o.Websocket.Port = -1
 			o.Websocket.HandshakeTimeout = 1
-			o.Websocket.NoTLS = true
 			s := RunServer(o)
 			defer s.Shutdown()
 
@@ -1319,6 +1276,9 @@ func TestAcceptLoopsDoNotLeaveOpenedConn(t *testing.T) {
 }
 
 func TestServerShutdownDuringStart(t *testing.T) {
+	testWebsocketAllowNonTLS = true
+	defer func() { testWebsocketAllowNonTLS = false }()
+
 	o := DefaultOptions()
 	o.DisableShortFirstPing = true
 	o.Accounts = []*Account{NewAccount("$SYS")}
@@ -1334,7 +1294,6 @@ func TestServerShutdownDuringStart(t *testing.T) {
 	o.Websocket.Host = "127.0.0.1"
 	o.Websocket.Port = -1
 	o.Websocket.HandshakeTimeout = 1
-	o.Websocket.NoTLS = true
 
 	// We are going to test that if the server is shutdown
 	// while Start() runs (in this case, before), we don't

@@ -14,11 +14,7 @@
 package server
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"net/http"
-	"net/textproto"
 )
 
 type parserState int
@@ -30,7 +26,6 @@ type parseState struct {
 	pa      pubArg
 	argBuf  []byte
 	msgBuf  []byte
-	header  http.Header // access via getHeader
 	scratch [MAX_CONTROL_LINE_SIZE]byte
 }
 
@@ -447,7 +442,7 @@ func (c *client) parse(buf []byte) error {
 				c.traceMsg(c.msgBuf)
 			}
 			c.processInboundMsg(c.msgBuf)
-			c.argBuf, c.msgBuf, c.header = nil, nil, nil
+			c.argBuf, c.msgBuf = nil, nil
 			c.drop, c.as, c.state = 0, i+1, OP_START
 			// Drop all pub args
 			c.pa.arg, c.pa.pacache, c.pa.origin, c.pa.account, c.pa.subject = nil, nil, nil, nil, nil
@@ -585,7 +580,7 @@ func (c *client) parse(buf []byte) error {
 					if trace {
 						c.traceInOp("SUB", arg)
 					}
-					err = c.parseSub(arg, false)
+					_, err = c.processSub(arg, false)
 				case ROUTER:
 					switch c.op {
 					case 'R', 'r':
@@ -1179,18 +1174,4 @@ func (c *client) clonePubArg() error {
 			return c.processHeaderPub(c.argBuf)
 		}
 	}
-}
-
-func (ps *parseState) getHeader() http.Header {
-	if ps.header == nil {
-		if hdr := ps.pa.hdr; hdr > 0 {
-			reader := bufio.NewReader(bytes.NewReader(ps.msgBuf[0:hdr]))
-			tp := textproto.NewReader(reader)
-			tp.ReadLine() // skip over first line, contains version
-			if mimeHeader, err := tp.ReadMIMEHeader(); err == nil {
-				ps.header = http.Header(mimeHeader)
-			}
-		}
-	}
-	return ps.header
 }

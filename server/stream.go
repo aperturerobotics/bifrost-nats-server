@@ -576,7 +576,16 @@ func (mset *Stream) subscribeInternal(subject string, cb msgHandler) (*subscript
 	mset.sid++
 
 	// Now create the subscription
-	return c.processSub([]byte(subject), nil, []byte(strconv.Itoa(mset.sid)), cb, false)
+	sub, err := c.processSub([]byte(subject+" "+strconv.Itoa(mset.sid)), false)
+	if err != nil {
+		return nil, err
+	} else if sub == nil {
+		return nil, fmt.Errorf("malformed subject")
+	}
+	c.mu.Lock()
+	sub.icb = cb
+	c.mu.Unlock()
+	return sub, nil
 }
 
 // Helper for unlocked stream.
@@ -961,27 +970,8 @@ func (mset *Stream) delete() error {
 
 // Internal function to stop or delete the stream.
 func (mset *Stream) stop(delete bool) error {
-	// Clean up consumers.
 	mset.mu.Lock()
-	var obs []*Consumer
-	for _, o := range mset.consumers {
-		obs = append(obs, o)
-	}
-	mset.consumers = nil
-	mset.mu.Unlock()
 
-	for _, o := range obs {
-		// Second flag says do not broadcast to signal.
-		// TODO(dlc) - If we have an err here we don't want to stop
-		// but should we log?
-		o.stop(delete, false, delete)
-	}
-
-	// Make sure we release all consumers here at once.
-	mset.mu.Lock()
-	mset.sg.Broadcast()
-
-	// Send stream delete advisory after the consumers.
 	if delete {
 		mset.sendDeleteAdvisoryLocked()
 	}
@@ -996,6 +986,11 @@ func (mset *Stream) stop(delete bool) error {
 		mset.mu.Unlock()
 		return nil
 	}
+	var obs []*Consumer
+	for _, o := range mset.consumers {
+		obs = append(obs, o)
+	}
+	mset.consumers = nil
 
 	// Cleanup duplicate timer if running.
 	if mset.ddtmr != nil {
@@ -1007,6 +1002,19 @@ func (mset *Stream) stop(delete bool) error {
 	mset.mu.Unlock()
 
 	c.closeConnection(ClientClosed)
+
+	// Clean up consumers.
+	for _, o := range obs {
+		// Second flag says do not broadcast to signal.
+		if err := o.stop(delete, false, delete); err != nil {
+			return err
+		}
+	}
+
+	// Make sure we release them all here at once.
+	mset.mu.Lock()
+	mset.sg.Broadcast()
+	mset.mu.Unlock()
 
 	if mset.store == nil {
 		return nil

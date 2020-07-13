@@ -92,7 +92,7 @@ func TestRouteConfig(t *testing.T) {
 }
 
 func TestClusterAdvertise(t *testing.T) {
-	lst, err := natsListen("tcp", "127.0.0.1:0")
+	lst, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("Error starting listener: %v", err)
 	}
@@ -1265,19 +1265,4 @@ func TestRouteCloseTLSConnection(t *testing.T) {
 	// Close the route
 	route.closeConnection(SlowConsumerWriteDeadline)
 	ch <- true
-}
-
-func TestRouteClusterNameConflictBetweenStaticAndDynamic(t *testing.T) {
-	o1 := DefaultOptions()
-	o1.Cluster.Name = "AAAAAAAAAAAAAAAAAAAA" // make it alphabetically the "smallest"
-	s1 := RunServer(o1)
-	defer s1.Shutdown()
-
-	o2 := DefaultOptions()
-	o2.Cluster.Name = "" // intentional, let it be assigned dynamically
-	o2.Routes = RoutesFromStr(fmt.Sprintf("nats://127.0.0.1:%d", o1.Cluster.Port))
-	s2 := RunServer(o2)
-	defer s2.Shutdown()
-
-	checkClusterFormed(t, s1, s2)
 }
