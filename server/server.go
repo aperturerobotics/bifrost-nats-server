@@ -250,6 +250,7 @@ func NewServer(opts *Options, keyPair nkeys.KeyPair) (*Server, error) {
 		gwLeafSubs: NewSublistWithCache(),
 		eventIds:   nuid.New(),
 	}
+	s.logging.logger = logger.NewLogger(opts.Logger, opts.Debug, opts.Trace, false)
 
 	// Trusted root operator keys.
 	if !s.processTrustedKeys() {

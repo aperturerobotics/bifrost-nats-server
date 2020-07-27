@@ -538,6 +538,11 @@ func setBaselineOptions(opts *Options) {
 	if opts.JetStreamMaxStore == 0 {
 		opts.JetStreamMaxStore = -1
 	}
+	if opts.Logger == nil {
+		l := logrus.New()
+		l.SetLevel(logrus.DebugLevel)
+		opts.Logger = logrus.NewEntry(l)
+	}
 }
 
 func normalizeBasePath(p string) string {
