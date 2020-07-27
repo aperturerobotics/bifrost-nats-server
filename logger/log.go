@@ -26,35 +26,18 @@ import (
 // Logger is the server logger
 type Logger struct {
 	sync.Mutex
-	logger     *logrus.Entry
-	debug      bool
-	trace      bool
-	infoLabel  string
-	warnLabel  string
-	errorLabel string
-	fatalLabel string
-	debugLabel string
-	traceLabel string
+	logger *logrus.Entry
+	debug  bool
+	trace  bool
 }
 
 // NewStdLogger creates a logger with output directed to Stderr
 func NewLogger(le *logrus.Entry, debug, trace, pid bool) *Logger {
-	/*
-		pre := ""
-		if pid {
-			pre = pidPrefix()
-		}
-	*/
-
-	l := &Logger{
+	return &Logger{
 		logger: le,
 		debug:  debug,
 		trace:  trace,
 	}
-
-	setPlainLabelFormats(l)
-
-	return l
 }
 
 type writerAndCloser interface {
@@ -66,22 +49,14 @@ type writerAndCloser interface {
 // NewTestLogger creates a logger with output directed to Stderr with a prefix.
 // Useful for tracing in tests when multiple servers are in the same pid
 func NewTestLogger(prefix string, time bool) *Logger {
-	/*
-		flags := 0
-		if time {
-			flags = log.LstdFlags | log.Lmicroseconds
-		}
-	*/
 	log := logrus.New()
 	log.SetLevel(logrus.DebugLevel)
 	le := logrus.NewEntry(log)
-	l := &Logger{
+	return &Logger{
 		logger: le,
 		debug:  true,
 		trace:  true,
 	}
-	setColoredLabelFormats(l)
-	return l
 }
 
 // Close implements the io.Closer interface to clean up
@@ -96,55 +71,35 @@ func pidPrefix() string {
 	return fmt.Sprintf("[%d] ", os.Getpid())
 }
 
-func setPlainLabelFormats(l *Logger) {
-	l.infoLabel = "[INF] "
-	l.debugLabel = "[DBG] "
-	l.warnLabel = "[WRN] "
-	l.errorLabel = "[ERR] "
-	l.fatalLabel = "[FTL] "
-	l.traceLabel = "[TRC] "
-}
-
-func setColoredLabelFormats(l *Logger) {
-	colorFormat := "[\x1b[%sm%s\x1b[0m] "
-	l.infoLabel = fmt.Sprintf(colorFormat, "32", "INF")
-	l.debugLabel = fmt.Sprintf(colorFormat, "36", "DBG")
-	l.warnLabel = fmt.Sprintf(colorFormat, "0;93", "WRN")
-	l.errorLabel = fmt.Sprintf(colorFormat, "31", "ERR")
-	l.fatalLabel = fmt.Sprintf(colorFormat, "31", "FTL")
-	l.traceLabel = fmt.Sprintf(colorFormat, "33", "TRC")
-}
-
 // Noticef logs a notice statement
 func (l *Logger) Noticef(format string, v ...interface{}) {
-	l.logger.Printf(l.infoLabel+format, v...)
+	l.logger.Infof(format, v...)
 }
 
 // Warnf logs a notice statement
 func (l *Logger) Warnf(format string, v ...interface{}) {
-	l.logger.Printf(l.warnLabel+format, v...)
+	l.logger.Warnf(format, v...)
 }
 
 // Errorf logs an error statement
 func (l *Logger) Errorf(format string, v ...interface{}) {
-	l.logger.Printf(l.errorLabel+format, v...)
+	l.logger.Errorf(format, v...)
 }
 
 // Fatalf logs a fatal error
 func (l *Logger) Fatalf(format string, v ...interface{}) {
-	l.logger.Fatalf(l.fatalLabel+format, v...)
+	l.logger.Errorf("[FATAL] "+format, v...)
 }
 
 // Debugf logs a debug statement
 func (l *Logger) Debugf(format string, v ...interface{}) {
-	if l.debug {
-		l.logger.Printf(l.debugLabel+format, v...)
-	}
+	// if l.debug {}
+	l.logger.Debugf(format, v...)
 }
 
 // Tracef logs a trace statement
 func (l *Logger) Tracef(format string, v ...interface{}) {
 	if l.trace {
-		l.logger.Printf(l.traceLabel+format, v...)
+		l.logger.Debugf("[TRACE] "+format, v...)
 	}
 }
