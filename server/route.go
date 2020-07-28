@@ -1590,8 +1590,8 @@ func (s *Server) startRouteAcceptLoop() {
 }
 
 // HandleRouterConnection handles an incoming route session.
-func (s *Server) HandleRouterConnection(conn net.Conn) {
-	s.createRoute(conn, "")
+func (s *Server) HandleRouterConnection(conn net.Conn, remoteID string) {
+	s.createRoute(conn, remoteID)
 }
 
 // StartRouting will start the accept loop on the cluster host:port
