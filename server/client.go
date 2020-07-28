@@ -4110,7 +4110,7 @@ func (c *client) teardownConn() {
 		// Capture these under lock
 		c.mu.Lock()
 		rid := c.route.remoteID
-		rtype := c.route.routeType
+		// rtype := c.route.routeType
 		c.mu.Unlock()
 
 		srv.mu.Lock()
@@ -4128,12 +4128,12 @@ func (c *client) teardownConn() {
 		} else if rid == srv.info.ID {
 			srv.Debugf("Detected route to self, ignoring")
 			return
-		} else if rtype != Implicit || retryImplicit {
+		} /*else if rtype != Implicit || retryImplicit {
 			srv.Debugf("Attempting reconnect for solicited route")
 			// Keep track of this go-routine so we can wait for it on
 			// server shutdown.
 			srv.startGoRoutine(func() { srv.reConnectToRoute(rid, rtype) })
-		}
+		}*/
 	} else if srv != nil && kind == GATEWAY && gwIsOutbound {
 		if gwCfg != nil {
 			srv.Debugf("Attempting reconnect for gateway %q", gwName)

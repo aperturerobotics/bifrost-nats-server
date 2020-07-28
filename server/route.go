@@ -16,9 +16,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"runtime"
 	"strings"
@@ -722,7 +720,7 @@ func (s *Server) processImplicitRoute(info *Info) {
 			r.User = url.UserPassword(opts.Cluster.Username, opts.Cluster.Password)
 		}
 	*/
-	s.startGoRoutine(func() { s.connectToRoute(remoteID, false, true) })
+	// s.startGoRoutine(func() { s.connectToRoute(remoteID, false, true) })
 }
 
 // hasThisRouteConfigured returns true if info.Host:info.Port is present
@@ -1608,6 +1606,7 @@ func (s *Server) StartRouting(clientListenReady chan struct{}) {
 
 }
 
+/*
 func (s *Server) reConnectToRoute(remoteID string, rtype RouteType) {
 	tryForEver := rtype == Explicit
 	// If A connects to B, and B to A (regardless if explicit or
@@ -1627,7 +1626,9 @@ func (s *Server) reConnectToRoute(remoteID string, rtype RouteType) {
 	}
 	s.connectToRoute(remoteID, tryForEver, false)
 }
+*/
 
+/*
 func (s *Server) connectToRoute(remoteID string, tryForEver, firstConnect bool) {
 	// Snapshot server options.
 	opts := s.getOpts()
@@ -1639,7 +1640,7 @@ func (s *Server) connectToRoute(remoteID string, tryForEver, firstConnect bool) 
 	attempts := 0
 	for s.isRunning() {
 		s.Debugf("Trying to connect to route %s", remoteID)
-		err := errors.New("BIFROST TODO EstablishLink to Route connectToRoute in nats")
+		err := errors.New("TODO EstablishLink to Route in nats to " + remoteID)
 		if err != nil {
 			attempts++
 			if s.shouldReportConnectErr(firstConnect, attempts) {
@@ -1674,6 +1675,7 @@ func (s *Server) connectToRoute(remoteID string, tryForEver, firstConnect bool) 
 		return
 	}
 }
+*/
 
 func (c *client) isSolicitedRoute() bool {
 	c.mu.Lock()
@@ -1682,10 +1684,12 @@ func (c *client) isSolicitedRoute() bool {
 }
 
 func (s *Server) solicitRoutes(routePeers []string) {
-	for _, r := range routePeers {
-		route := r
-		s.startGoRoutine(func() { s.connectToRoute(route, true, true) })
-	}
+	/*
+		for _, r := range routePeers {
+			route := r
+			s.startGoRoutine(func() { s.connectToRoute(route, true, true) })
+		}
+	*/
 }
 
 func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error {
