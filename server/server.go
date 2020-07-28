@@ -1186,11 +1186,13 @@ func (s *Server) fetchAccount(name string) (*Account, error) {
 func (s *Server) Start() {
 	s.Noticef("Starting nats-server version %s", VERSION)
 	s.Debugf("Go build version %s", s.info.GoVersion)
-	gc := gitCommit
-	if gc == "" {
-		gc = "not set"
-	}
-	s.Noticef("Git commit [%s]", gc)
+	/*
+		gc := gitCommit
+		if gc == "" {
+			gc = "not set"
+		}
+		s.Noticef("Git commit [%s]", gc)
+	*/
 
 	// Check for insecure configurations.
 	s.checkAuthforWarnings()

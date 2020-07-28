@@ -493,6 +493,7 @@ func (c *client) processRouteInfo(info *Info) {
 		// Need to set this so that the close does the right thing
 		c.route.remoteID = info.ID
 		c.mu.Unlock()
+		c.Debugf("Detected route to self them %q == us %q", info.ID, s.info.ID)
 		c.closeConnection(DuplicateRoute)
 		return
 	}
