@@ -40,3 +40,4 @@ _testmain.go
 
 # Goland
 .idea
+vendor/

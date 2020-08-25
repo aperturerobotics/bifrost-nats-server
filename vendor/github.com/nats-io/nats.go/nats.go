@@ -123,6 +123,7 @@ var (
 	ErrDisconnected           = errors.New("nats: server is disconnected")
 	ErrHeadersNotSupported    = errors.New("nats: headers not supported by this server")
 	ErrBadHeaderMsg           = errors.New("nats: message could not decode headers")
+	ErrNoResponders           = errors.New("nats: no responders available for request")
 )
 
 func init() {
@@ -145,11 +146,6 @@ func GetDefaultOptions() Options {
 		DrainTimeout:       DefaultDrainTimeout,
 	}
 }
-
-// DEPRECATED: Use GetDefaultOptions() instead.
-// DefaultOptions is not safe for use by multiple clients.
-// For details see #308.
-var DefaultOptions = GetDefaultOptions()
 
 // Status represents the state of the connection.
 type Status int
@@ -311,13 +307,6 @@ type Options struct {
 	// no longer be connected.
 	ClosedCB ConnHandler
 
-	// DisconnectedCB sets the disconnected handler that is called
-	// whenever the connection is disconnected.
-	// Will not be called if DisconnectedErrCB is set
-	// DEPRECATED. Use DisconnectedErrCB which passes error that caused
-	// the disconnect event.
-	DisconnectedCB ConnHandler
-
 	// DisconnectedErrCB sets the disconnected error handler that is called
 	// whenever the connection is disconnected.
 	// Disconnected error could be nil, for instance when user explicitly closes the connection.
@@ -369,10 +358,6 @@ type Options struct {
 	// TokenHandler designates the function used to generate the token to be used when connecting to a server.
 	TokenHandler AuthTokenHandler
 
-	// Dialer allows a custom net.Dialer when forming connections.
-	// DEPRECATED: should use CustomDialer instead.
-	Dialer *net.Dialer
-
 	// CustomDialer allows to specify a custom dialer (not necessarily
 	// a *net.Dialer).
 	CustomDialer CustomDialer
@@ -391,6 +376,15 @@ type Options struct {
 	// gradually disconnect all its connections before shuting down. This is
 	// often used in deployments when upgrading NATS Servers.
 	LameDuckModeHandler ConnHandler
+
+	// RetryOnFailedConnect sets the connection in reconnecting state right
+	// away if it can't connect to a server in the initial set. The
+	// MaxReconnect and ReconnectWait options are used for this process,
+	// similarly to when an established connection is disconnected.
+	// If a ReconnectHandler is set, it will be invoked when the connection
+	// is established, and if a ClosedHandler is set, it will be invoked if
+	// it fails to connect (after exhausting the MaxReconnect attempts).
+	RetryOnFailedConnect bool
 }
 
 const (
@@ -589,21 +583,22 @@ const (
 )
 
 type connectInfo struct {
-	Verbose   bool   `json:"verbose"`
-	Pedantic  bool   `json:"pedantic"`
-	UserJWT   string `json:"jwt,omitempty"`
-	Nkey      string `json:"nkey,omitempty"`
-	Signature string `json:"sig,omitempty"`
-	User      string `json:"user,omitempty"`
-	Pass      string `json:"pass,omitempty"`
-	Token     string `json:"auth_token,omitempty"`
-	TLS       bool   `json:"tls_required"`
-	Name      string `json:"name"`
-	Lang      string `json:"lang"`
-	Version   string `json:"version"`
-	Protocol  int    `json:"protocol"`
-	Echo      bool   `json:"echo"`
-	Headers   bool   `json:"headers"`
+	Verbose      bool   `json:"verbose"`
+	Pedantic     bool   `json:"pedantic"`
+	UserJWT      string `json:"jwt,omitempty"`
+	Nkey         string `json:"nkey,omitempty"`
+	Signature    string `json:"sig,omitempty"`
+	User         string `json:"user,omitempty"`
+	Pass         string `json:"pass,omitempty"`
+	Token        string `json:"auth_token,omitempty"`
+	TLS          bool   `json:"tls_required"`
+	Name         string `json:"name"`
+	Lang         string `json:"lang"`
+	Version      string `json:"version"`
+	Protocol     int    `json:"protocol"`
+	Echo         bool   `json:"echo"`
+	Headers      bool   `json:"headers"`
+	NoResponders bool   `json:"no_responders"`
 }
 
 // MsgHandler is a callback function that processes messages delivered to
@@ -815,15 +810,6 @@ func DisconnectErrHandler(cb ConnErrHandler) Option {
 	}
 }
 
-// DisconnectHandler is an Option to set the disconnected handler.
-// DEPRECATED: Use DisconnectErrHandler.
-func DisconnectHandler(cb ConnHandler) Option {
-	return func(o *Options) error {
-		o.DisconnectedCB = cb
-		return nil
-	}
-}
-
 // ReconnectHandler is an Option to set the reconnected handler.
 func ReconnectHandler(cb ConnHandler) Option {
 	return func(o *Options) error {
@@ -949,16 +935,6 @@ func SyncQueueLen(max int) Option {
 	}
 }
 
-// Dialer is an Option to set the dialer which will be used when
-// attempting to establish a connection.
-// DEPRECATED: Should use CustomDialer instead.
-func Dialer(dialer *net.Dialer) Option {
-	return func(o *Options) error {
-		o.Dialer = dialer
-		return nil
-	}
-}
-
 // SetCustomDialer is an Option to set a custom dialer which will be
 // used when attempting to establish a connection. If both Dialer
 // and CustomDialer are specified, CustomDialer takes precedence.
@@ -998,18 +974,17 @@ func LameDuckModeHandler(cb ConnHandler) Option {
 	}
 }
 
-// Handler processing
-
-// SetDisconnectHandler will set the disconnect event handler.
-// DEPRECATED: Use SetDisconnectErrHandler
-func (nc *Conn) SetDisconnectHandler(dcb ConnHandler) {
-	if nc == nil {
-		return
+// RetryOnFailedConnect sets the connection in reconnecting state right away
+// if it can't connect to a server in the initial set.
+// See RetryOnFailedConnect option for more details.
+func RetryOnFailedConnect(retry bool) Option {
+	return func(o *Options) error {
+		o.RetryOnFailedConnect = retry
+		return nil
 	}
-	nc.mu.Lock()
-	defer nc.mu.Unlock()
-	nc.Opts.DisconnectedCB = dcb
 }
+
+// Handler processing
 
 // SetDisconnectErrHandler will set the disconnect event handler.
 func (nc *Conn) SetDisconnectErrHandler(dcb ConnErrHandler) {
@@ -1100,13 +1075,6 @@ func (o Options) Connect() (*Conn, error) {
 	// Check if we have an nkey but no signature callback defined.
 	if nc.Opts.Nkey != "" && nc.Opts.SignatureCB == nil {
 		return nil, ErrNkeyButNoSigCB
-	}
-
-	// Allow custom Dialer for connecting using DialTimeout by default
-	if nc.Opts.Dialer == nil {
-		nc.Opts.Dialer = &net.Dialer{
-			Timeout: nc.Opts.Timeout,
-		}
 	}
 
 	if err := nc.setupServerPool(); err != nil {
@@ -1375,9 +1343,9 @@ func (nc *Conn) createConn() (err error) {
 	dialer := nc.Opts.CustomDialer
 	if dialer == nil {
 		// We will copy and shorten the timeout if we have multiple hosts to try.
-		copyDialer := *nc.Opts.Dialer
+		copyDialer := &net.Dialer{Timeout: nc.Opts.Timeout}
 		copyDialer.Timeout = copyDialer.Timeout / time.Duration(len(hosts))
-		dialer = &copyDialer
+		dialer = copyDialer
 	}
 
 	if len(hosts) > 1 && !nc.Opts.NoRandomize {
@@ -1576,7 +1544,9 @@ func (nc *Conn) connect() error {
 				nc.mu.Unlock()
 				nc.close(DISCONNECTED, false, err)
 				nc.mu.Lock()
-				nc.current = nil
+				// Do not reset nc.current here since it would prevent
+				// RetryOnFailedConnect to work should this be the last server
+				// to try before starting doReconnect().
 			}
 		} else {
 			// Cancel out default connection refused, will trigger the
@@ -1586,9 +1556,25 @@ func (nc *Conn) connect() error {
 			}
 		}
 	}
-	nc.initc = false
+
 	if returnedErr == nil && nc.status != CONNECTED {
 		returnedErr = ErrNoServers
+	}
+
+	if returnedErr == nil {
+		nc.initc = false
+	} else if nc.Opts.RetryOnFailedConnect {
+		nc.setup()
+		nc.status = RECONNECTING
+		nc.pending = new(bytes.Buffer)
+		if nc.bw == nil {
+			nc.bw = nc.newBuffer()
+		}
+		nc.bw.Reset(nc.pending)
+		go nc.doReconnect(ErrNoServers)
+		returnedErr = nil
+	} else {
+		nc.current = nil
 	}
 
 	return returnedErr
@@ -1711,8 +1697,10 @@ func (nc *Conn) connectProto() (string, error) {
 		token = nc.Opts.TokenHandler()
 	}
 
+	// If our server does not support headers then we can't do them or no responders.
+	hdrs := nc.info.Headers
 	cinfo := connectInfo{o.Verbose, o.Pedantic, ujwt, nkey, sig, user, pass, token,
-		o.Secure, o.Name, LangString, Version, clientProtoInfo, !o.NoEcho, true}
+		o.Secure, o.Name, LangString, Version, clientProtoInfo, !o.NoEcho, hdrs, hdrs}
 
 	b, err := json.Marshal(cinfo)
 	if err != nil {
@@ -1907,11 +1895,10 @@ func (nc *Conn) doReconnect(err error) {
 	// Clear any errors.
 	nc.err = nil
 	// Perform appropriate callback if needed for a disconnect.
-	// DisconnectedErrCB has priority over deprecated DisconnectedCB
-	if nc.Opts.DisconnectedErrCB != nil {
-		nc.ach.push(func() { nc.Opts.DisconnectedErrCB(nc, err) })
-	} else if nc.Opts.DisconnectedCB != nil {
-		nc.ach.push(func() { nc.Opts.DisconnectedCB(nc) })
+	if !nc.initc {
+		if nc.Opts.DisconnectedErrCB != nil {
+			nc.ach.push(func() { nc.Opts.DisconnectedErrCB(nc, err) })
+		}
 	}
 
 	// This is used to wait on go routines exit if we start them in the loop
@@ -2051,6 +2038,10 @@ func (nc *Conn) doReconnect(err error) {
 
 		// This is where we are truly connected.
 		nc.status = CONNECTED
+
+		// If we are here with a retry on failed connect, indicate that the
+		// initial connect is now complete.
+		nc.initc = false
 
 		// Queue up the reconnect callback.
 		if nc.Opts.ReconnectedCB != nil {
@@ -2528,7 +2519,7 @@ func (nc *Conn) processInfo(info string) error {
 	// did not include themselves in the async INFO protocol.
 	// If empty, do not remove the implicit servers from the pool.
 	if len(ncInfo.ConnectURLs) == 0 {
-		if ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
+		if !nc.initc && ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
 			nc.ach.push(func() { nc.Opts.LameDuckModeHandler(nc) })
 		}
 		return nil
@@ -2591,7 +2582,7 @@ func (nc *Conn) processInfo(info string) error {
 			nc.ach.push(func() { nc.Opts.DiscoveredServersCB(nc) })
 		}
 	}
-	if ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
+	if !nc.initc && ncInfo.LameDuckMode && nc.Opts.LameDuckModeHandler != nil {
 		nc.ach.push(func() { nc.Opts.LameDuckModeHandler(nc) })
 	}
 	return nil
@@ -2689,20 +2680,27 @@ func NewMsg(subject string) *Msg {
 }
 
 const (
-	hdrLine   = "NATS/1.0\r\n"
-	crlf      = "\r\n"
-	hdrPreEnd = len(hdrLine) - len(crlf)
+	hdrLine      = "NATS/1.0\r\n"
+	crlf         = "\r\n"
+	hdrPreEnd    = len(hdrLine) - len(crlf)
+	statusHdr    = "Status"
+	noResponders = "503"
 )
 
 // decodeHeadersMsg will decode and headers.
 func decodeHeadersMsg(data []byte) (http.Header, error) {
 	tp := textproto.NewReader(bufio.NewReader(bytes.NewReader(data)))
-	if l, err := tp.ReadLine(); err != nil || l != hdrLine[:hdrPreEnd] {
+	l, err := tp.ReadLine()
+	if err != nil || len(l) < hdrPreEnd || l[:hdrPreEnd] != hdrLine[:hdrPreEnd] {
 		return nil, ErrBadHeaderMsg
 	}
 	mh, err := tp.ReadMIMEHeader()
 	if err != nil {
 		return nil, ErrBadHeaderMsg
+	}
+	// Check if we have an inlined status.
+	if len(l) > hdrPreEnd {
+		mh.Add(statusHdr, strings.TrimLeft(l[hdrPreEnd:], " "))
 	}
 	return http.Header(mh), nil
 }
@@ -2765,7 +2763,8 @@ func (nc *Conn) publish(subj, reply string, hdr, data []byte) error {
 
 	// Proactively reject payloads over the threshold set by server.
 	msgSize := int64(len(data) + len(hdr))
-	if msgSize > nc.info.MaxPayload {
+	// Skip this check if we are not yet connected (RetryOnFailedConnect)
+	if !nc.initc && msgSize > nc.info.MaxPayload {
 		nc.mu.Unlock()
 		return ErrMaxPayload
 	}
@@ -2904,6 +2903,7 @@ func (nc *Conn) respHandler(m *Msg) {
 
 // Helper to setup and send new request style requests. Return the chan to receive the response.
 func (nc *Conn) createNewRequestAndSend(subj string, hdr, data []byte) (chan *Msg, string, error) {
+	nc.mu.Lock()
 	// Do setup for the new style if needed.
 	if nc.respMap == nil {
 		nc.initNewResp()
@@ -2944,7 +2944,6 @@ func (nc *Conn) RequestMsg(msg *Msg, timeout time.Duration) (*Msg, error) {
 		if !nc.info.Headers {
 			return nil, ErrHeadersNotSupported
 		}
-
 		hdr, err = msg.headerBytes()
 		if err != nil {
 			return nil, err
@@ -2960,18 +2959,32 @@ func (nc *Conn) Request(subj string, data []byte, timeout time.Duration) (*Msg, 
 	return nc.request(subj, nil, data, timeout)
 }
 
+func (nc *Conn) useOldRequestStyle() bool {
+	nc.mu.RLock()
+	r := nc.Opts.UseOldRequestStyle
+	nc.mu.RUnlock()
+	return r
+}
+
 func (nc *Conn) request(subj string, hdr, data []byte, timeout time.Duration) (*Msg, error) {
 	if nc == nil {
 		return nil, ErrInvalidConnection
 	}
 
-	nc.mu.Lock()
-	if nc.Opts.UseOldRequestStyle {
-		nc.mu.Unlock()
-		return nc.oldRequest(subj, hdr, data, timeout)
+	var m *Msg
+	var err error
+
+	if nc.useOldRequestStyle() {
+		m, err = nc.oldRequest(subj, hdr, data, timeout)
+	} else {
+		m, err = nc.newRequest(subj, hdr, data, timeout)
 	}
 
-	return nc.newRequest(subj, hdr, data, timeout)
+	// Check for no responder status.
+	if err == nil && len(m.Data) == 0 && m.Header.Get(statusHdr) == noResponders {
+		m, err = nil, ErrNoResponders
+	}
+	return m, err
 }
 
 func (nc *Conn) newRequest(subj string, hdr, data []byte, timeout time.Duration) (*Msg, error) {
@@ -3565,13 +3578,6 @@ func (s *Subscription) processNextMsgDelivered(msg *Msg) error {
 	return nil
 }
 
-// Queued returns the number of queued messages in the client for this subscription.
-// DEPRECATED: Use Pending()
-func (s *Subscription) QueuedMsgs() (int, error) {
-	m, _, err := s.Pending()
-	return int(m), err
-}
-
 // Pending returns the number of queued messages and queued bytes in the client for this subscription.
 func (s *Subscription) Pending() (int, int, error) {
 	if s == nil {
@@ -3989,8 +3995,6 @@ func (nc *Conn) close(status Status, doCBs bool, err error) {
 		if nc.conn != nil {
 			if nc.Opts.DisconnectedErrCB != nil {
 				nc.ach.push(func() { nc.Opts.DisconnectedErrCB(nc, err) })
-			} else if nc.Opts.DisconnectedCB != nil {
-				nc.ach.push(func() { nc.Opts.DisconnectedCB(nc) })
 			}
 		}
 		if nc.Opts.ClosedCB != nil {
@@ -4236,6 +4240,13 @@ func (nc *Conn) MaxPayload() int64 {
 	nc.mu.RLock()
 	defer nc.mu.RUnlock()
 	return nc.info.MaxPayload
+}
+
+// HeadersSupported will return if the server supports headers
+func (nc *Conn) HeadersSupported() bool {
+	nc.mu.RLock()
+	defer nc.mu.RUnlock()
+	return nc.info.Headers
 }
 
 // AuthRequired will return if the connected server requires authorization.

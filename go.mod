@@ -1,5 +1,10 @@
 module github.com/nats-io/nats-server/v2
 
+go 1.13
+
+// aperture: use aperture-2.0 branch of fork
+replace github.com/nats-io/nats.go => github.com/aperturerobotics/bifrost-nats-client v0.0.0-20200825033028-791dcff35ed5 // aperture-2.0
+
 require (
 	github.com/minio/highwayhash v1.0.0
 	github.com/nats-io/jwt/v2 v2.0.0-20200820224411-1e751ff168ab
@@ -11,5 +16,3 @@ require (
 	golang.org/x/sys v0.0.0-20191022100944-742c48ecaeb7
 	golang.org/x/time v0.0.0-20200416051211-89c76fbcd5d1
 )
-
-go 1.13
