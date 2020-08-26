@@ -52,7 +52,6 @@ type Account struct {
 	sl           *Sublist
 	ic           *client
 	isid         uint64
-	etmr         *time.Timer
 	ctmr         *time.Timer
 	strack       map[string]sconns
 	nrclients    int32
@@ -348,7 +347,6 @@ func (a *Account) clearEventing() {
 	a.mu.Lock()
 	a.nrclients = 0
 	// Now clear state
-	clearTimer(&a.etmr)
 	clearTimer(&a.ctmr)
 	a.clients = nil
 	a.strack = nil
@@ -831,7 +829,6 @@ type LatencyClient struct {
 	Name    string        `json:"name,omitempty"`
 	Lang    string        `json:"lang,omitempty"`
 	Version string        `json:"ver,omitempty"`
-	IP      string        `json:"ip,omitempty"`
 	CID     uint64        `json:"cid,omitempty"`
 	Server  string        `json:"server,omitempty"`
 }
@@ -2216,41 +2213,6 @@ func (a *Account) IsExpired() bool {
 	return exp
 }
 
-// Called when an account has expired.
-func (a *Account) expiredTimeout() {
-	// Mark expired first.
-	a.mu.Lock()
-	a.expired = true
-	a.mu.Unlock()
-
-	// Collect the clients and expire them.
-	cs := make([]*client, 0, len(a.clients))
-	a.mu.RLock()
-	for c := range a.clients {
-		cs = append(cs, c)
-	}
-	a.mu.RUnlock()
-
-	for _, c := range cs {
-		c.accountAuthExpired()
-	}
-}
-
-// Sets the expiration timer for an account JWT that has it set.
-func (a *Account) setExpirationTimer(d time.Duration) {
-	a.etmr = time.AfterFunc(d, a.expiredTimeout)
-}
-
-// Lock should be held
-func (a *Account) clearExpirationTimer() bool {
-	if a.etmr == nil {
-		return true
-	}
-	stopped := a.etmr.Stop()
-	a.etmr = nil
-	return stopped
-}
-
 // checkUserRevoked will check if a user has been revoked.
 func (a *Account) checkUserRevoked(nkey string) bool {
 	a.mu.RLock()
@@ -2262,26 +2224,6 @@ func (a *Account) checkUserRevoked(nkey string) bool {
 		return false
 	}
 	return true
-}
-
-// Check expiration and set the proper state as needed.
-func (a *Account) checkExpiration(claims *jwt.ClaimsData) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	a.clearExpirationTimer()
-	if claims.Expires == 0 {
-		a.expired = false
-		return
-	}
-	tn := time.Now().Unix()
-	if claims.Expires <= tn {
-		a.expired = true
-		return
-	}
-	expiresAt := time.Duration(claims.Expires - tn)
-	a.setExpirationTimer(expiresAt * time.Second)
-	a.expired = false
 }
 
 // hasIssuer returns true if the issuer matches the account
@@ -2354,7 +2296,6 @@ func (s *Server) UpdateAccountClaims(a *Account, ac *jwt.AccountClaims) {
 		return
 	}
 	s.Debugf("Updating account claims: %s", a.Name)
-	a.checkExpiration(ac.Claims())
 
 	a.mu.Lock()
 	// Clone to update, only select certain fields.

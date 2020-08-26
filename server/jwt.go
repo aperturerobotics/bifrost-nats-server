@@ -16,7 +16,6 @@ package server
 import (
 	"fmt"
 	"io/ioutil"
-	"net"
 	"regexp"
 	"strings"
 	"time"
@@ -141,28 +140,6 @@ func validateTrustedOperators(o *Options) error {
 		}
 	}
 	return nil
-}
-
-func validateSrc(claims *jwt.UserClaims, host string) bool {
-	if claims == nil {
-		return false
-	} else if claims.Src == "" {
-		return true
-	} else if host == "" {
-		return false
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, cidr := range strings.Split(claims.Src, ",") {
-		if _, net, err := net.ParseCIDR(cidr); err != nil {
-			return false // should not happen as this jwt is invalid
-		} else if net.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func validateTimes(claims *jwt.UserClaims) (bool, time.Duration) {

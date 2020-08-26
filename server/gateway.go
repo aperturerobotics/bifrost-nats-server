@@ -16,9 +16,8 @@ package server
 import (
 	"bytes"
 	"crypto/sha256"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net"
@@ -66,13 +65,6 @@ const gatewayTLSInsecureWarning = "TLS certificate chain and hostname of solicit
 // Used by tests.
 func SetGatewaysSolicitDelay(delay time.Duration) {
 	atomic.StoreInt64(&gatewaySolicitDelay, int64(delay))
-}
-
-// ResetGatewaysSolicitDelay resets the initial delay before gateways
-// connections are initiated to its default values.
-// Used by tests.
-func ResetGatewaysSolicitDelay() {
-	atomic.StoreInt64(&gatewaySolicitDelay, int64(defaultSolicitGatewaysDelay))
 }
 
 const (
@@ -123,8 +115,6 @@ type srvGateway struct {
 	outo     []*client              // outbound gateways maintained in an order suitable for sending msgs (currently based on RTT)
 	in       map[uint64]*client     // inbound gateways
 	remotes  map[string]*gatewayCfg // Config of remote gateways
-	URLs     refCountedUrlSet       // Set of all Gateway URLs in the cluster
-	URL      string                 // This server gateway URL (after possible random port is resolved)
 	info     *Info                  // Gateway Info protocol
 	infoJSON []byte                 // Marshal'ed Info protocol
 	runknown bool                   // Rejects unknown (not configured) gateway connections
@@ -153,7 +143,6 @@ type srvGateway struct {
 	// This is to track recent subscriptions for a given connection
 	rsubs sync.Map
 
-	resolver  netResolver   // Used to resolve host name before calling net.Dial()
 	sqbsz     int           // Max buffer size to send queue subs protocol. Used for testing.
 	recSubExp time.Duration // For how long do we check if there is a subscription match for a message with reply
 }
@@ -170,7 +159,6 @@ type gatewayCfg struct {
 	*RemoteGatewayOpts
 	hash           []byte
 	oldHash        []byte
-	urls           map[string]*url.URL
 	connAttempts   int
 	tlsName        string
 	implicit       bool
@@ -235,35 +223,30 @@ func (r *RemoteGatewayOpts) clone() *RemoteGatewayOpts {
 	if r == nil {
 		return nil
 	}
-	clone := &RemoteGatewayOpts{
+	return &RemoteGatewayOpts{
 		Name: r.Name,
-		URLs: deepCopyURLs(r.URLs),
 	}
-	if r.TLSConfig != nil {
-		clone.TLSConfig = r.TLSConfig.Clone()
-		clone.TLSTimeout = r.TLSTimeout
-	}
-	return clone
 }
 
 // Ensure that gateway is properly configured.
 func validateGatewayOptions(o *Options) error {
-	if o.Gateway.Name == "" && o.Gateway.Port == 0 {
+	if o.Gateway.Name == "" {
 		return nil
 	}
-	if o.Gateway.Name == "" {
-		return fmt.Errorf("gateway has no name")
-	}
-	if o.Gateway.Port == 0 {
-		return fmt.Errorf("gateway %q has no port specified (select -1 for random port)", o.Gateway.Name)
-	}
+	/*
+		if o.Gateway.Name == "" {
+			return fmt.Errorf("gateway has no name")
+		}
+	*/
 	for i, g := range o.Gateway.Gateways {
 		if g.Name == "" {
 			return fmt.Errorf("gateway in the list %d has no name", i)
 		}
-		if len(g.URLs) == 0 {
-			return fmt.Errorf("gateway %q has no URL", g.Name)
-		}
+		/*
+			if len(g.URLs) == 0 {
+				return fmt.Errorf("gateway %q has no URL", g.Name)
+			}
+		*/
 	}
 	return nil
 }
@@ -298,8 +281,6 @@ func (s *Server) newGateway(opts *Options) error {
 		outo:     make([]*client, 0, 4),
 		in:       make(map[uint64]*client),
 		remotes:  make(map[string]*gatewayCfg),
-		URLs:     make(refCountedUrlSet),
-		resolver: opts.Gateway.resolver,
 		runknown: opts.Gateway.RejectUnknown,
 		oldHash:  getOldHash(opts.Gateway.Name),
 	}
@@ -324,10 +305,6 @@ func (s *Server) newGateway(opts *Options) error {
 
 	gateway.pasi.m = make(map[string]map[string]*sitally)
 
-	if gateway.resolver == nil {
-		gateway.resolver = netResolver(net.DefaultResolver)
-	}
-
 	// Create remote gateways
 	for _, rgo := range opts.Gateway.Gateways {
 		// Ignore if there is a remote gateway with our name.
@@ -338,29 +315,30 @@ func (s *Server) newGateway(opts *Options) error {
 			RemoteGatewayOpts: rgo.clone(),
 			hash:              getHash(rgo.Name),
 			oldHash:           getOldHash(rgo.Name),
-			urls:              make(map[string]*url.URL, len(rgo.URLs)),
+			// urls:              make(map[string]*url.URL, len(rgo.URLs)),
 		}
-		if opts.Gateway.TLSConfig != nil && cfg.TLSConfig == nil {
-			cfg.TLSConfig = opts.Gateway.TLSConfig.Clone()
-		}
-		if cfg.TLSTimeout == 0 {
-			cfg.TLSTimeout = opts.Gateway.TLSTimeout
-		}
-		for _, u := range rgo.URLs {
-			// For TLS, look for a hostname that we can use for TLSConfig.ServerName
-			cfg.saveTLSHostname(u)
-			cfg.urls[u.Host] = u
-		}
+		/*
+			if opts.Gateway.TLSConfig != nil && cfg.TLSConfig == nil {
+				cfg.TLSConfig = opts.Gateway.TLSConfig.Clone()
+			}
+		*/
+		/*
+			for _, u := range rgo.URLs {
+				// For TLS, look for a hostname that we can use for TLSConfig.ServerName
+				cfg.saveTLSHostname(u)
+				cfg.urls[u.Host] = u
+			}
+		*/
 		gateway.remotes[cfg.Name] = cfg
 	}
 
-	gateway.sqbsz = opts.Gateway.sendQSubsBufSize
-	if gateway.sqbsz == 0 {
-		gateway.sqbsz = maxBufSize
-	}
+	// gateway.sqbsz = opts.Gateway.sendQSubsBufSize
+	// if gateway.sqbsz == 0 {
+	gateway.sqbsz = maxBufSize
+	// }
 	gateway.recSubExp = defaultGatewayRecentSubExpiration
 
-	gateway.enabled = opts.Gateway.Name != "" && opts.Gateway.Port != 0
+	gateway.enabled = opts.Gateway.Name != "" // && opts.Gateway.Port != 0
 	s.gateway = gateway
 	return nil
 }
@@ -412,128 +390,30 @@ func (s *Server) startGateways() {
 // is detected that the server has already been shutdown.
 func (s *Server) startGatewayAcceptLoop() {
 	// Snapshot server options.
-	opts := s.getOpts()
+	// opts := s.getOpts()
 
-	port := opts.Gateway.Port
-	if port == -1 {
-		port = 0
-	}
+	/*
+		port := opts.Gateway.Port
+		if port == -1 {
+			port = 0
+		}
+	*/
 
 	s.mu.Lock()
 	if s.shutdown {
 		s.mu.Unlock()
 		return
 	}
-	hp := net.JoinHostPort(opts.Gateway.Host, strconv.Itoa(port))
-	l, e := natsListen("tcp", hp)
-	if e != nil {
-		s.mu.Unlock()
-		s.Fatalf("Error listening on gateway port: %d - %v", opts.Gateway.Port, e)
-		return
-	}
+
 	s.Noticef("Gateway name is %s", s.getGatewayName())
-	s.Noticef("Listening for gateways connections on %s",
-		net.JoinHostPort(opts.Gateway.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
+	s.Noticef("Listening for gateway connections on internal mux")
 
-	tlsReq := opts.Gateway.TLSConfig != nil
-	authRequired := opts.Gateway.Username != ""
-	info := &Info{
-		ID:           s.info.ID,
-		Name:         opts.ServerName,
-		Version:      s.info.Version,
-		AuthRequired: authRequired,
-		TLSRequired:  tlsReq,
-		TLSVerify:    tlsReq,
-		MaxPayload:   s.info.MaxPayload,
-		Gateway:      opts.Gateway.Name,
-		GatewayNRP:   true,
-		Headers:      s.supportsHeaders(),
-	}
-	// If we have selected a random port...
-	if port == 0 {
-		// Write resolved port back to options.
-		opts.Gateway.Port = l.Addr().(*net.TCPAddr).Port
-	}
-	// Possibly override Host/Port based on Gateway.Advertise
-	if err := s.setGatewayInfoHostPort(info, opts); err != nil {
-		s.Fatalf("Error setting gateway INFO with Gateway.Advertise value of %s, err=%v", opts.Gateway.Advertise, err)
-		l.Close()
-		s.mu.Unlock()
-		return
-	}
-	// Setup state that can enable shutdown
-	s.gatewayListener = l
-
-	// Warn if insecure is configured in the main Gateway configuration
-	// or any of the RemoteGateway's. This means that we need to check
-	// remotes even if TLS would not be configured for the accept.
-	warn := tlsReq && opts.Gateway.TLSConfig.InsecureSkipVerify
-	if !warn {
-		for _, g := range opts.Gateway.Gateways {
-			if g.TLSConfig != nil && g.TLSConfig.InsecureSkipVerify {
-				warn = true
-				break
-			}
-		}
-	}
-	if warn {
-		s.Warnf(gatewayTLSInsecureWarning)
-	}
-	go s.acceptConnections(l, "Gateway", func(conn net.Conn) { s.createGateway(nil, nil, conn) }, nil)
 	s.mu.Unlock()
 }
 
-// Similar to setInfoHostPortAndGenerateJSON, but for gatewayInfo.
-func (s *Server) setGatewayInfoHostPort(info *Info, o *Options) error {
-	gw := s.gateway
-	gw.Lock()
-	defer gw.Unlock()
-	gw.URLs.removeUrl(gw.URL)
-	if o.Gateway.Advertise != "" {
-		advHost, advPort, err := parseHostPort(o.Gateway.Advertise, o.Gateway.Port)
-		if err != nil {
-			return err
-		}
-		info.Host = advHost
-		info.Port = advPort
-	} else {
-		info.Host = o.Gateway.Host
-		info.Port = o.Gateway.Port
-		// If the host is "0.0.0.0" or "::" we need to resolve to a public IP.
-		// This will return at most 1 IP.
-		hostIsIPAny, ips, err := s.getNonLocalIPsIfHostIsIPAny(info.Host, false)
-		if err != nil {
-			return err
-		}
-		if hostIsIPAny {
-			if len(ips) == 0 {
-				// TODO(ik): Should we fail here (prevent starting)? If not, we
-				// are going to "advertise" the 0.0.0.0:<port> url, which means
-				// that remote are going to try to connect to 0.0.0.0:<port>,
-				// which means a connect to loopback address, which is going
-				// to fail with either TLS error, conn refused if the remote
-				// is using different gateway port than this one, or error
-				// saying that it tried to connect to itself.
-				s.Errorf("Could not find any non-local IP for gateway %q with listen specification %q",
-					gw.name, info.Host)
-			} else {
-				// Take the first from the list...
-				info.Host = ips[0]
-			}
-		}
-	}
-	gw.URL = net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
-	if o.Gateway.Advertise != "" {
-		s.Noticef("Advertise address for gateway %q is set to %s", gw.name, gw.URL)
-	} else {
-		s.Noticef("Address for gateway %q is %s", gw.name, gw.URL)
-	}
-	gw.URLs[gw.URL]++
-	gw.info = info
-	info.GatewayURL = gw.URL
-	// (re)generate the gatewayInfoJSON byte array
-	gw.generateInfoJSON()
-	return nil
+// HandleGatewayConnection handles an incoming gateway session.
+func (s *Server) HandleGatewayConnection(conn net.Conn) {
+	s.createGateway(nil, nil, conn)
 }
 
 // Generates the Gateway INFO protocol.
@@ -545,7 +425,6 @@ func (g *srvGateway) generateInfoJSON() {
 	if !g.enabled {
 		return
 	}
-	g.info.GatewayURLs = g.URLs.getAsStringSlice()
 	b, err := json.Marshal(g.info)
 	if err != nil {
 		panic(err)
@@ -608,43 +487,22 @@ func (s *Server) solicitGateway(cfg *gatewayCfg, firstConnect bool) {
 		typeStr = "explicit"
 	}
 
-	const connFmt = "Connecting to %s gateway %q (%s) at %s (attempt %v)"
-	const connErrFmt = "Error connecting to %s gateway %q (%s) at %s (attempt %v): %v"
+	const connFmt = "Connecting to %s gateway %q (attempt %v)"
 
 	for s.isRunning() {
-		urls := cfg.getURLs()
-		if len(urls) == 0 {
-			break
-		}
 		attempts++
 		report := s.shouldReportConnectErr(firstConnect, attempts)
-		// Iteration is random
-		for _, u := range urls {
-			address, err := s.getRandomIP(s.gateway.resolver, u.Host)
-			if err != nil {
-				s.Errorf("Error getting IP for %s gateway %q (%s): %v", typeStr, cfg.Name, u.Host, err)
-				continue
-			}
-			if report {
-				s.Noticef(connFmt, typeStr, cfg.Name, u.Host, address, attempts)
-			} else {
-				s.Debugf(connFmt, typeStr, cfg.Name, u.Host, address, attempts)
-			}
-			conn, err := natsDialTimeout("tcp", address, DEFAULT_ROUTE_DIAL)
-			if err == nil {
-				// We could connect, create the gateway connection and return.
-				s.createGateway(cfg, u, conn)
-				return
-			}
-			if report {
-				s.Errorf(connErrFmt, typeStr, cfg.Name, u.Host, address, attempts, err)
-			} else {
-				s.Debugf(connErrFmt, typeStr, cfg.Name, u.Host, address, attempts, err)
-			}
-			// Break this loop if server is being shutdown...
-			if !s.isRunning() {
-				break
-			}
+		// use EstablishLink directive
+		// address, err := s.getRandomIP(s.gateway.resolver, u.Host)
+		err := errors.New("TODO BIFROST EstablishLink in nats")
+		if err != nil {
+			s.Errorf("Error getting IP for %s gateway %q: %v", typeStr, cfg.Name, err)
+			continue
+		}
+		if report {
+			s.Noticef(connFmt, typeStr, cfg.Name, attempts)
+		} else {
+			s.Debugf(connFmt, typeStr, cfg.Name, attempts)
 		}
 		if isImplicit {
 			if opts.Gateway.ConnectRetries == 0 || attempts > opts.Gateway.ConnectRetries {
@@ -674,19 +532,13 @@ func (s *Server) solicitGateway(cfg *gatewayCfg, firstConnect bool) {
 // If solicited, the gateway is marked as outbound.
 func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 	// Snapshot server options.
-	opts := s.getOpts()
+	// opts := s.getOpts()
 
 	now := time.Now()
 	c := &client{srv: s, nc: conn, start: now, last: now, kind: GATEWAY}
 
 	// Are we creating the gateway based on the configuration
 	solicit := cfg != nil
-	var tlsRequired bool
-	if solicit {
-		tlsRequired = cfg.TLSConfig != nil
-	} else {
-		tlsRequired = opts.Gateway.TLSConfig != nil
-	}
 
 	s.gateway.RLock()
 	infoJSON := s.gateway.infoJSON
@@ -711,76 +563,6 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 		c.flags.set(expectConnect)
 		// Inbound gateway connection
 		c.Noticef("Processing inbound gateway connection")
-	}
-
-	// Check for TLS
-	if tlsRequired {
-		var host string
-		var timeout float64
-		// If we solicited, we will act like the client, otherwise the server.
-		if solicit {
-			c.Debugf("Starting TLS gateway client handshake")
-			cfg.RLock()
-			tlsName := cfg.tlsName
-			tlsConfig := cfg.TLSConfig.Clone()
-			timeout = cfg.TLSTimeout
-			cfg.RUnlock()
-			if tlsConfig.ServerName == "" {
-				// If the given url is a hostname, use this hostname for the
-				// ServerName. If it is an IP, use the cfg's tlsName. If none
-				// is available, resort to current IP.
-				host = url.Hostname()
-				if tlsName != "" && net.ParseIP(host) != nil {
-					host = tlsName
-				}
-				tlsConfig.ServerName = host
-			}
-			c.nc = tls.Client(c.nc, tlsConfig)
-		} else {
-			c.Debugf("Starting TLS gateway server handshake")
-			c.nc = tls.Server(c.nc, opts.Gateway.TLSConfig)
-			timeout = opts.Gateway.TLSTimeout
-		}
-
-		conn := c.nc.(*tls.Conn)
-
-		// Setup the timeout
-		ttl := secondsToDuration(timeout)
-		time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
-		conn.SetReadDeadline(time.Now().Add(ttl))
-
-		c.mu.Unlock()
-		if err := conn.Handshake(); err != nil {
-			if solicit {
-				// Based on type of error, possibly clear the saved tlsName
-				// See: https://github.com/nats-io/nats-server/issues/1256
-				if _, ok := err.(x509.HostnameError); ok {
-					cfg.Lock()
-					if host == cfg.tlsName {
-						cfg.tlsName = ""
-					}
-					cfg.Unlock()
-				}
-			}
-			c.Errorf("TLS gateway handshake error: %v", err)
-			c.sendErr("Secure Connection - TLS Required")
-			c.closeConnection(TLSHandshakeError)
-			return
-		}
-		// Reset the read deadline
-		conn.SetReadDeadline(time.Time{})
-
-		// Re-Grab lock
-		c.mu.Lock()
-
-		// To be consistent with client, set this flag to indicate that handshake is done
-		c.flags.set(handshakeComplete)
-
-		// Verify that the connection did not go away while we released the lock.
-		if c.isClosed() {
-			c.mu.Unlock()
-			return
-		}
 	}
 
 	// Do final client initialization
@@ -813,12 +595,6 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 	// Spin up the write loop.
 	s.startGoRoutine(func() { c.writeLoop() })
 
-	if tlsRequired {
-		c.Debugf("TLS handshake complete")
-		cs := c.nc.(*tls.Conn).ConnectionState()
-		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tlsCipher(cs.CipherSuite))
-	}
-
 	// Set the Ping timer after sending connect and info.
 	s.setFirstPingTimer(c)
 
@@ -827,7 +603,6 @@ func (s *Server) createGateway(cfg *gatewayCfg, url *url.URL, conn net.Conn) {
 
 // Builds and sends the CONNECT protocol for a gateway.
 func (c *client) sendGatewayConnect() {
-	tlsRequired := c.gw.cfg.TLSConfig != nil
 	url := c.gw.connectURL
 	c.gw.connectURL = nil
 	var user, pass string
@@ -840,7 +615,6 @@ func (c *client) sendGatewayConnect() {
 		Pedantic: false,
 		User:     user,
 		Pass:     pass,
-		TLS:      tlsRequired,
 		Name:     c.srv.info.ID,
 		Gateway:  c.srv.getGatewayName(),
 	}
@@ -915,7 +689,7 @@ func (c *client) processGatewayConnect(arg []byte) error {
 func (c *client) processGatewayInfo(info *Info) {
 	var (
 		gwName string
-		cfg    *gatewayCfg
+		// cfg    *gatewayCfg
 	)
 	c.mu.Lock()
 	s := c.srv
@@ -927,7 +701,7 @@ func (c *client) processGatewayInfo(info *Info) {
 	isOutbound := c.gw.outbound
 	if isOutbound {
 		gwName = c.gw.name
-		cfg = c.gw.cfg
+		// cfg = c.gw.cfg
 	} else if isFirstINFO {
 		c.gw.name = info.Gateway
 	}
@@ -972,9 +746,11 @@ func (c *client) processGatewayInfo(info *Info) {
 		}
 
 		// Possibly add URLs that we get from the INFO protocol.
-		if len(info.GatewayURLs) > 0 {
-			cfg.updateURLs(info.GatewayURLs)
-		}
+		/*
+			if len(info.GatewayURLs) > 0 {
+				cfg.updateURLs(info.GatewayURLs)
+			}
+		*/
 
 		// If this is the first INFO, send our connect
 		if isFirstINFO {
@@ -1070,6 +846,7 @@ func (s *Server) gossipGatewaysToInboundGateway(gwName string, c *client) {
 	gw.RLock()
 	defer gw.RUnlock()
 	for gwCfgName, cfg := range gw.remotes {
+		_ = cfg
 		// Skip the gateway that we just created
 		if gwCfgName == gwName {
 			continue
@@ -1078,15 +855,10 @@ func (s *Server) gossipGatewaysToInboundGateway(gwName string, c *client) {
 			ID:         s.info.ID,
 			GatewayCmd: gatewayCmdGossip,
 		}
-		urls := cfg.getURLsAsStrings()
-		if len(urls) > 0 {
-			info.Gateway = gwCfgName
-			info.GatewayURLs = urls
-			b, _ := json.Marshal(&info)
-			c.mu.Lock()
-			c.enqueueProto([]byte(fmt.Sprintf(InfoProto, b)))
-			c.mu.Unlock()
-		}
+		b, _ := json.Marshal(&info)
+		c.mu.Lock()
+		c.enqueueProto([]byte(fmt.Sprintf(InfoProto, b)))
+		c.mu.Unlock()
 	}
 }
 
@@ -1103,11 +875,11 @@ func (s *Server) forwardNewGatewayToLocalCluster(oinfo *Info) {
 	// would not match the route's remoteID), but will fail to do so because
 	// the sent protocol will not have host/port defined.
 	info := &Info{
-		ID:          "GW" + s.info.ID,
-		Name:        s.getOpts().ServerName,
-		Gateway:     oinfo.Gateway,
-		GatewayURLs: oinfo.GatewayURLs,
-		GatewayCmd:  gatewayCmdGossip,
+		ID:      "GW" + s.info.ID,
+		Name:    s.getOpts().ServerName,
+		Gateway: oinfo.Gateway,
+		// GatewayURLs: oinfo.GatewayURLs,
+		GatewayCmd: gatewayCmdGossip,
 	}
 	b, _ := json.Marshal(info)
 	infoJSON := []byte(fmt.Sprintf(InfoProto, b))
@@ -1247,15 +1019,11 @@ func (s *Server) sendGatewayConfigsToRoute(route *client) {
 		GatewayCmd: gatewayCmdGossip,
 	}
 	for _, cfg := range gwCfgs {
-		urls := cfg.getURLsAsStrings()
-		if len(urls) > 0 {
-			info.Gateway = cfg.Name
-			info.GatewayURLs = urls
-			b, _ := json.Marshal(&info)
-			route.mu.Lock()
-			route.enqueueProto([]byte(fmt.Sprintf(InfoProto, b)))
-			route.mu.Unlock()
-		}
+		info.Gateway = cfg.Name
+		b, _ := json.Marshal(&info)
+		route.mu.Lock()
+		route.enqueueProto([]byte(fmt.Sprintf(InfoProto, b)))
+		route.mu.Unlock()
 	}
 }
 
@@ -1277,34 +1045,16 @@ func (s *Server) processImplicitGateway(info *Info) {
 	// Check if we already have this config, and if so, we are done
 	cfg := s.gateway.remotes[gwName]
 	if cfg != nil {
-		// However, possibly augment the list of URLs with the given
-		// info.GatewayURLs content.
-		cfg.Lock()
-		cfg.addURLs(info.GatewayURLs)
-		cfg.Unlock()
 		return
 	}
-	opts := s.getOpts()
+	// opts := s.getOpts()
 	cfg = &gatewayCfg{
 		RemoteGatewayOpts: &RemoteGatewayOpts{Name: gwName},
 		hash:              getHash(gwName),
 		oldHash:           getOldHash(gwName),
-		urls:              make(map[string]*url.URL, len(info.GatewayURLs)),
 		implicit:          true,
 	}
-	if opts.Gateway.TLSConfig != nil {
-		cfg.TLSConfig = opts.Gateway.TLSConfig.Clone()
-		cfg.TLSTimeout = opts.Gateway.TLSTimeout
-	}
 
-	// Since we know we don't have URLs (no config, so just based on what we
-	// get from INFO), directly call addURLs(). We don't need locking since
-	// we just created that structure and no one else has access to it yet.
-	cfg.addURLs(info.GatewayURLs)
-	// If there is no URL, we can't proceed.
-	if len(cfg.urls) == 0 {
-		return
-	}
 	s.gateway.remotes[gwName] = cfg
 	s.startGoRoutine(func() {
 		s.solicitGateway(cfg, true)
@@ -1371,114 +1121,6 @@ func (g *gatewayCfg) isImplicit() bool {
 	return ii
 }
 
-// getURLs returns an array of URLs in random order suitable for
-// an iteration to try to connect.
-func (g *gatewayCfg) getURLs() []*url.URL {
-	g.RLock()
-	a := make([]*url.URL, 0, len(g.urls))
-	for _, u := range g.urls {
-		a = append(a, u)
-	}
-	g.RUnlock()
-	// Map iteration is random, but not that good with small maps.
-	rand.Shuffle(len(a), func(i, j int) {
-		a[i], a[j] = a[j], a[i]
-	})
-	return a
-}
-
-// Similar to getURLs but returns the urls as an array of strings.
-func (g *gatewayCfg) getURLsAsStrings() []string {
-	g.RLock()
-	a := make([]string, 0, len(g.urls))
-	for _, u := range g.urls {
-		a = append(a, u.Host)
-	}
-	g.RUnlock()
-	return a
-}
-
-// updateURLs creates the urls map with the content of the config's URLs array
-// and the given array that we get from the INFO protocol.
-func (g *gatewayCfg) updateURLs(infoURLs []string) {
-	g.Lock()
-	// Clear the map...
-	g.urls = make(map[string]*url.URL, len(g.URLs)+len(infoURLs))
-	// Add the urls from the config URLs array.
-	for _, u := range g.URLs {
-		g.urls[u.Host] = u
-	}
-	// Then add the ones from the infoURLs array we got.
-	g.addURLs(infoURLs)
-	g.Unlock()
-}
-
-// Saves the hostname of the given URL (if not already done).
-// This may be used as the ServerName of the TLSConfig when initiating a
-// TLS connection.
-// Write lock held on entry.
-func (g *gatewayCfg) saveTLSHostname(u *url.URL) {
-	if g.TLSConfig != nil && g.tlsName == "" && net.ParseIP(u.Hostname()) == nil {
-		g.tlsName = u.Hostname()
-	}
-}
-
-// add URLs from the given array to the urls map only if not already present.
-// remoteGateway write lock is assumed to be held on entry.
-// Write lock is held on entry.
-func (g *gatewayCfg) addURLs(infoURLs []string) {
-	var scheme string
-	if g.TLSConfig != nil {
-		scheme = "tls"
-	} else {
-		scheme = "nats"
-	}
-	for _, iu := range infoURLs {
-		if _, present := g.urls[iu]; !present {
-			// Urls in Info.GatewayURLs come without scheme. Add it to parse
-			// the url (otherwise it fails).
-			if u, err := url.Parse(fmt.Sprintf("%s://%s", scheme, iu)); err == nil {
-				// Also, if a tlsName has not been set yet and we are dealing
-				// with a hostname and not a bare IP, save the hostname.
-				g.saveTLSHostname(u)
-				// Use u.Host for the key.
-				g.urls[u.Host] = u
-				// Signal that we have updated the list. Used by monitoring code.
-				g.varzUpdateURLs = true
-			}
-		}
-	}
-}
-
-// Adds this URL to the set of Gateway URLs.
-// Returns true if the URL has been added, false otherwise.
-// Server lock held on entry
-func (s *Server) addGatewayURL(urlStr string) bool {
-	s.gateway.Lock()
-	added := s.gateway.URLs.addUrl(urlStr)
-	if added {
-		s.gateway.generateInfoJSON()
-	}
-	s.gateway.Unlock()
-	return added
-}
-
-// Removes this URL from the set of gateway URLs.
-// Returns true if the URL has been removed, false otherwise.
-// Server lock held on entry
-func (s *Server) removeGatewayURL(urlStr string) bool {
-	if s.shutdown {
-		return false
-	}
-	s.gateway.Lock()
-	removed := s.gateway.URLs.removeUrl(urlStr)
-	if removed {
-		s.gateway.generateInfoJSON()
-	}
-	s.gateway.Unlock()
-	return removed
-}
-
 // Sends a Gateway's INFO to all inbound GW connections.
 // Server lock is held on entry
 func (s *Server) sendAsyncGatewayInfo() {
@@ -1489,15 +1131,6 @@ func (s *Server) sendAsyncGatewayInfo() {
 		ig.mu.Unlock()
 	}
 	s.gateway.RUnlock()
-}
-
-// This returns the URL of the Gateway listen spec, or empty string
-// if the server has no gateway configured.
-func (s *Server) getGatewayURL() string {
-	s.gateway.RLock()
-	url := s.gateway.URL
-	s.gateway.RUnlock()
-	return url
 }
 
 // Returns this server gateway name.
@@ -1654,16 +1287,6 @@ func (s *Server) removeRemoteGatewayConnection(c *client) {
 			c.removeReplySub(sub)
 		}
 	}
-}
-
-// GatewayAddr returns the net.Addr object for the gateway listener.
-func (s *Server) GatewayAddr() *net.TCPAddr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.gatewayListener == nil {
-		return nil
-	}
-	return s.gatewayListener.Addr().(*net.TCPAddr)
 }
 
 // A- protocol received from the remote after sending messages
