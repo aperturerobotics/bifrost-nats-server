@@ -15,7 +15,6 @@ package server
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -215,14 +214,11 @@ type client struct {
 	ncs        string
 	out        outbound
 	user       *NkeyUser
-	host       string
-	port       uint16
 	subs       map[string]*subscription
 	replies    map[string]*resp
 	mperms     *msgDeny
 	darray     []string
 	pcd        map[*client]struct{}
-	atmr       *time.Timer
 	ping       pinfo
 	msgb       [msgScratchSize]byte
 	last       time.Time
@@ -234,7 +230,6 @@ type client struct {
 	route *route
 	gw    *gateway
 	leaf  *leaf
-	ws    *websocket
 
 	// To keep track of gateway replies mapping
 	gwrm map[string]*gwReplyMap
@@ -382,17 +377,6 @@ func (c *client) GetOpts() *clientOpts {
 	return &c.opts
 }
 
-// GetTLSConnectionState returns the TLS ConnectionState if TLS is enabled, nil
-// otherwise. Implements the ClientAuth interface.
-func (c *client) GetTLSConnectionState() *tls.ConnectionState {
-	tc, ok := c.nc.(*tls.Conn)
-	if !ok {
-		return nil
-	}
-	state := tc.ConnectionState()
-	return &state
-}
-
 // This is the main subscription struct that indicates
 // interest in published messages.
 // FIXME(dlc) - This is getting bloated for normal subs, need
@@ -428,7 +412,6 @@ type clientOpts struct {
 	Echo         bool   `json:"echo"`
 	Verbose      bool   `json:"verbose"`
 	Pedantic     bool   `json:"pedantic"`
-	TLSRequired  bool   `json:"tls_required"`
 	Nkey         string `json:"nkey,omitempty"`
 	JWT          string `json:"jwt,omitempty"`
 	Sig          string `json:"sig,omitempty"`
@@ -489,33 +472,16 @@ func (c *client) initClient() {
 	c.pcd = make(map[*client]struct{})
 
 	// snapshot the string version of the connection
-	var conn string
-	if c.nc != nil {
-		if addr := c.nc.RemoteAddr(); addr != nil {
-			if conn = addr.String(); conn != _EMPTY_ {
-				host, port, _ := net.SplitHostPort(conn)
-				iPort, _ := strconv.Atoi(port)
-				c.host, c.port = host, uint16(iPort)
-				// Now that we have extracted host and port, escape
-				// the string because it is going to be used in Sprintf
-				conn = strings.ReplaceAll(conn, "%", "%%")
-			}
-		}
-	}
-
 	switch c.kind {
 	case CLIENT:
 		name := "cid"
-		if c.ws != nil {
-			name = "wid"
-		}
-		c.ncs = fmt.Sprintf("%s - %s:%d", conn, name, c.cid)
+		c.ncs = fmt.Sprintf("%s:%d", name, c.cid)
 	case ROUTER:
-		c.ncs = fmt.Sprintf("%s - rid:%d", conn, c.cid)
+		c.ncs = fmt.Sprintf("rid:%d", c.cid)
 	case GATEWAY:
-		c.ncs = fmt.Sprintf("%s - gid:%d", conn, c.cid)
+		c.ncs = fmt.Sprintf("gid:%d", c.cid)
 	case LEAF:
-		c.ncs = fmt.Sprintf("%s - lid:%d", conn, c.cid)
+		c.ncs = fmt.Sprintf("lid:%d", c.cid)
 	case SYSTEM:
 		c.ncs = "SYSTEM"
 	case JETSTREAM:
@@ -766,27 +732,6 @@ func (c *client) setPermissions(perms *Permissions) {
 	}
 }
 
-// Check to see if we have an expiration for the user JWT via base claims.
-// FIXME(dlc) - Clear on connect with new JWT.
-func (c *client) setExpiration(claims *jwt.ClaimsData, validFor time.Duration) {
-	if claims.Expires == 0 {
-		if validFor != 0 {
-			c.setExpirationTimer(validFor)
-		}
-		return
-	}
-	expiresAt := time.Duration(0)
-	tn := time.Now().Unix()
-	if claims.Expires > tn {
-		expiresAt = time.Duration(claims.Expires-tn) * time.Second
-	}
-	if validFor != 0 && validFor < expiresAt {
-		c.setExpirationTimer(validFor)
-	} else {
-		c.setExpirationTimer(expiresAt)
-	}
-}
-
 // This will load up the deny structure used for filtering delivered
 // messages based on a deny clause for subscriptions.
 // Lock should be held.
@@ -911,7 +856,6 @@ func (c *client) readLoop(pre []byte) {
 		return
 	}
 	nc := c.nc
-	ws := c.ws != nil
 	c.in.rsz = startBufSize
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
@@ -944,12 +888,6 @@ func (c *client) readLoop(pre []byte) {
 	var _bufs [1][]byte
 	bufs := _bufs[:1]
 
-	var wsr *wsReadInfo
-	if ws {
-		wsr = &wsReadInfo{}
-		wsr.init()
-	}
-
 	// If we have a pre parse that first.
 	if len(pre) > 0 {
 		c.parse(pre)
@@ -962,19 +900,7 @@ func (c *client) readLoop(pre []byte) {
 			c.closeConnection(closedStateForErr(err))
 			return
 		}
-		if ws {
-			bufs, err = c.wsRead(wsr, nc, b[:n])
-			if bufs == nil && err != nil {
-				if err != io.EOF {
-					c.Errorf("read error: %v", err)
-				}
-				c.closeConnection(closedStateForErr(err))
-			} else if bufs == nil {
-				continue
-			}
-		} else {
-			bufs[0] = b[:n]
-		}
+		bufs[0] = b[:n]
 		start := time.Now()
 
 		// Clear inbound stats cache
@@ -1078,9 +1004,6 @@ func closedStateForErr(err error) ClosedState {
 // collapsePtoNB will place primary onto nb buffer as needed in prep for WriteTo.
 // This will return a copy on purpose.
 func (c *client) collapsePtoNB() (net.Buffers, int64) {
-	if c.ws != nil {
-		return c.wsCollapsePtoNB()
-	}
 	if c.out.p != nil {
 		p := c.out.p
 		c.out.p = nil
@@ -1092,10 +1015,6 @@ func (c *client) collapsePtoNB() (net.Buffers, int64) {
 // This will handle the fixup needed on a partial write.
 // Assume pending has been already calculated correctly.
 func (c *client) handlePartialWrite(pnb net.Buffers) {
-	if c.ws != nil {
-		c.ws.frames = append(pnb, c.ws.frames...)
-		return
-	}
 	nb, _ := c.collapsePtoNB()
 	// The partial needs to be first, so append nb to pnb
 	c.out.nb = append(pnb, nb...)
@@ -1186,9 +1105,6 @@ func (c *client) flushOutbound() bool {
 
 	// Subtract from pending bytes and messages.
 	c.out.pb -= n
-	if c.ws != nil {
-		c.ws.fs -= n
-	}
 	c.out.pm -= apm // FIXME(dlc) - this will not be totally accurate on partials.
 
 	// Check for partial writes
@@ -1248,16 +1164,7 @@ func (c *client) flushOutbound() bool {
 // Returns a boolean to indicate if the connection has been closed or not.
 // Lock is held on entry.
 func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) bool {
-	if tlsConn, ok := c.nc.(*tls.Conn); ok {
-		if !tlsConn.ConnectionState().HandshakeComplete {
-			// Likely a TLSTimeout error instead...
-			c.markConnAsClosed(TLSHandshakeError)
-			// Would need to coordinate with tlstimeout()
-			// to avoid double logging, so skip logging
-			// here, and don't report a slow consumer error.
-			return true
-		}
-	} else if c.flags.isSet(expectConnect) && !c.flags.isSet(connectReceived) {
+	if c.flags.isSet(expectConnect) && !c.flags.isSet(connectReceived) {
 		// Under some conditions, a connection may hit a slow consumer write deadline
 		// before the authorization timeout. If that is the case, then we handle
 		// as slow consumer though we do not increase the counter as that can be
@@ -1302,12 +1209,15 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 	if c.flags.isSet(connMarkedClosed) {
 		return
 	}
+	_ = skipFlush
 	c.flags.set(connMarkedClosed)
 	// For a websocket client, unless we are told not to flush, enqueue
 	// a websocket CloseMessage based on the reason.
-	if !skipFlush && c.ws != nil && !c.ws.closeSent {
-		c.wsEnqueueCloseMessage(reason)
-	}
+	/*
+		if !skipFlush && c.ws != nil && !c.ws.closeSent {
+			c.wsEnqueueCloseMessage(reason)
+		}
+	*/
 	// Be consistent with the creation: for routes and gateways,
 	// we use Noticef on create, so use that too for delete.
 	if c.srv != nil {
@@ -1474,17 +1384,19 @@ func (c *client) processConnect(arg []byte) error {
 	supportsHeaders := c.srv.supportsHeaders()
 	c.mu.Lock()
 	// If we can't stop the timer because the callback is in progress...
-	if !c.clearAuthTimer() {
-		// wait for it to finish and handle sending the failure back to
-		// the client.
-		for !c.isClosed() {
+	/*
+		if !c.clearAuthTimer() {
+			// wait for it to finish and handle sending the failure back to
+			// the client.
+			for !c.isClosed() {
+				c.mu.Unlock()
+				time.Sleep(25 * time.Millisecond)
+				c.mu.Lock()
+			}
 			c.mu.Unlock()
-			time.Sleep(25 * time.Millisecond)
-			c.mu.Lock()
+			return nil
 		}
-		c.mu.Unlock()
-		return nil
-	}
+	*/
 	c.last = time.Now()
 	// Estimate RTT to start.
 	if c.kind == CLIENT {
@@ -1517,10 +1429,6 @@ func (c *client) processConnect(arg []byte) error {
 	account := c.opts.Account
 	accountNew := c.opts.AccountNew
 
-	// If websocket client and JWT not in the CONNECT, use the cookie JWT (possibly empty).
-	if ws := c.ws; ws != nil && c.opts.JWT == "" {
-		c.opts.JWT = ws.cookieJwt
-	}
 	ujwt := c.opts.JWT
 
 	// For headers both client and server need to support.
@@ -1867,12 +1775,7 @@ func (c *client) sendPing() {
 // Assume lock is held.
 func (c *client) generateClientInfoJSON(info Info) []byte {
 	info.CID = c.cid
-	info.ClientIP = c.host
 	info.MaxPayload = c.mpay
-	if c.ws != nil {
-		info.ClientConnectURLs = info.WSConnectURLs
-	}
-	info.WSConnectURLs = nil
 	// Generate the info json
 	b, _ := json.Marshal(info)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
@@ -3851,34 +3754,11 @@ func (c *client) clearPingTimer() {
 	c.ping.tmr = nil
 }
 
-// Lock should be held
-func (c *client) setAuthTimer(d time.Duration) {
-	c.atmr = time.AfterFunc(d, c.authTimeout)
-}
-
-// Lock should be held
-func (c *client) clearAuthTimer() bool {
-	if c.atmr == nil {
-		return true
-	}
-	stopped := c.atmr.Stop()
-	c.atmr = nil
-	return stopped
-}
-
 // We may reuse atmr for expiring user jwts,
 // so check connectReceived.
 // Lock assume held on entry.
 func (c *client) awaitingAuth() bool {
-	return !c.flags.isSet(connectReceived) && c.atmr != nil
-}
-
-// This will set the atmr for the JWT expiration time.
-// We will lock on entry.
-func (c *client) setExpirationTimer(d time.Duration) {
-	c.mu.Lock()
-	c.atmr = time.AfterFunc(d, c.authExpired)
-	c.mu.Unlock()
+	return !c.flags.isSet(connectReceived) //  && c.atmr != nil
 }
 
 // Possibly flush the connection and then close the low level connection.
@@ -4021,7 +3901,7 @@ func (c *client) closeConnection(reason ClosedState) {
 	// so don't set this to 1, instead bump the count.
 	c.rref++
 	c.flags.set(closeConnection)
-	c.clearAuthTimer()
+	// c.clearAuthTimer()
 	c.clearPingTimer()
 	c.markConnAsClosed(reason)
 
@@ -4032,12 +3912,10 @@ func (c *client) closeConnection(reason ClosedState) {
 	}
 
 	var (
-		connectURLs   []string
-		wsConnectURLs []string
-		kind          = c.kind
-		srv           = c.srv
-		noReconnect   = c.flags.isSet(noReconnect)
-		acc           = c.acc
+		kind        = c.kind
+		srv         = c.srv
+		noReconnect = c.flags.isSet(noReconnect)
+		acc         = c.acc
 	)
 
 	// Snapshot for use if we are a client connection.
@@ -4053,11 +3931,6 @@ func (c *client) closeConnection(reason ClosedState) {
 			sub.close()
 			subs = append(subs, sub)
 		}
-	}
-
-	if c.route != nil {
-		connectURLs = c.route.connectURLs
-		wsConnectURLs = c.route.wsConnURLs
 	}
 
 	// If we have remote latency tracking running shut that down.
@@ -4076,13 +3949,6 @@ func (c *client) closeConnection(reason ClosedState) {
 	}
 
 	if srv != nil {
-		// If this is a route that disconnected, possibly send an INFO with
-		// the updated list of connect URLs to clients that know how to
-		// handle async INFOs.
-		if (len(connectURLs) > 0 || len(wsConnectURLs) > 0) && !srv.getOpts().Cluster.NoAdvertise {
-			srv.removeConnectURLsAndSendINFOToClients(connectURLs, wsConnectURLs)
-		}
-
 		// Unregister
 		srv.removeClient(c)
 
@@ -4166,8 +4032,7 @@ func (c *client) reconnect() {
 		// Capture these under lock
 		c.mu.Lock()
 		rid := c.route.remoteID
-		rtype := c.route.routeType
-		rurl := c.route.url
+		// rtype := c.route.routeType
 		c.mu.Unlock()
 
 		srv.mu.Lock()
@@ -4183,14 +4048,14 @@ func (c *client) reconnect() {
 			srv.Debugf("Not attempting reconnect for solicited route, already connected to \"%s\"", rid)
 			return
 		} else if rid == srv.info.ID {
-			srv.Debugf("Detected route to self, ignoring \"%s\"", rurl)
+			srv.Debugf("Detected route to self, ignoring")
 			return
-		} else if rtype != Implicit || retryImplicit {
-			srv.Debugf("Attempting reconnect for solicited route \"%s\"", rurl)
+		} /*else if rtype != Implicit || retryImplicit {
+			srv.Debugf("Attempting reconnect for solicited route")
 			// Keep track of this go-routine so we can wait for it on
 			// server shutdown.
-			srv.startGoRoutine(func() { srv.reConnectToRoute(rurl, rtype) })
-		}
+			srv.startGoRoutine(func() { srv.reConnectToRoute(rid, rtype) })
+		}*/
 	} else if srv != nil && kind == GATEWAY && gwIsOutbound {
 		if gwCfg != nil {
 			srv.Debugf("Attempting reconnect for gateway %q", gwName)
@@ -4327,7 +4192,6 @@ func (c *client) getClientInfo(detailed bool) LatencyClient {
 	// Detailed is opt in.
 	if detailed {
 		lc.Start = c.start.UTC()
-		lc.IP = c.host
 		lc.CID = c.cid
 		lc.Name = c.opts.Name
 		lc.User = c.getRawAuthUser()

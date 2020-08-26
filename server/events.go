@@ -145,7 +145,6 @@ type ServerInfo struct {
 // ClientInfo is detailed information about the client forming a connection.
 type ClientInfo struct {
 	Start   time.Time  `json:"start,omitempty"`
-	Host    string     `json:"host,omitempty"`
 	ID      uint64     `json:"id"`
 	Account string     `json:"acc"`
 	User    string     `json:"user,omitempty"`
@@ -238,7 +237,6 @@ RESET:
 	sysacc := s.sys.account
 	sendq := s.sys.sendq
 	id := s.info.ID
-	host := s.info.Host
 	servername := s.info.Name
 	seqp := &s.sys.seq
 	js := s.js != nil
@@ -264,7 +262,6 @@ RESET:
 		case pm := <-sendq:
 			if pm.si != nil {
 				pm.si.Name = servername
-				pm.si.Host = host
 				pm.si.Cluster = cluster
 				pm.si.ID = id
 				pm.si.Seq = atomic.AddUint64(seqp, 1)
@@ -893,9 +890,6 @@ func (s *Server) filterRequest(fOpts *EventFilterOptions) bool {
 	if fOpts.Name != "" && !strings.Contains(s.info.Name, fOpts.Name) {
 		return true
 	}
-	if fOpts.Host != "" && !strings.Contains(s.info.Host, fOpts.Host) {
-		return true
-	}
 	if fOpts.Cluster != "" {
 		s.mu.Lock()
 		cluster := s.info.Cluster
@@ -1124,7 +1118,6 @@ func (s *Server) accountConnectEvent(c *client) {
 		},
 		Client: ClientInfo{
 			Start:   c.start,
-			Host:    c.host,
 			ID:      c.cid,
 			Account: accForClient(c),
 			User:    c.getRawAuthUser(),
@@ -1168,7 +1161,6 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 		Client: ClientInfo{
 			Start:   c.start,
 			Stop:    &now,
-			Host:    c.host,
 			ID:      c.cid,
 			Account: accForClient(c),
 			User:    c.getRawAuthUser(),
@@ -1213,7 +1205,6 @@ func (s *Server) sendAuthErrorEvent(c *client) {
 		Client: ClientInfo{
 			Start:   c.start,
 			Stop:    &now,
-			Host:    c.host,
 			ID:      c.cid,
 			Account: accForClient(c),
 			User:    c.getRawAuthUser(),

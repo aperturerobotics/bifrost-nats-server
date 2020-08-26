@@ -14,7 +14,6 @@
 package server
 
 import (
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -102,8 +101,6 @@ const (
 // ConnInfo has detailed information on a per connection basis.
 type ConnInfo struct {
 	Cid            uint64      `json:"cid"`
-	IP             string      `json:"ip"`
-	Port           int         `json:"port"`
 	Start          time.Time   `json:"start"`
 	LastActivity   time.Time   `json:"last_activity"`
 	Stop           *time.Time  `json:"stop,omitempty"`
@@ -120,8 +117,6 @@ type ConnInfo struct {
 	Name           string      `json:"name,omitempty"`
 	Lang           string      `json:"lang,omitempty"`
 	Version        string      `json:"version,omitempty"`
-	TLSVersion     string      `json:"tls_version,omitempty"`
-	TLSCipher      string      `json:"tls_cipher_suite,omitempty"`
 	AuthorizedUser string      `json:"authorized_user,omitempty"`
 	Account        string      `json:"account,omitempty"`
 	Subs           []string    `json:"subscriptions_list,omitempty"`
@@ -458,21 +453,6 @@ func (ci *ConnInfo) fill(client *client, nc net.Conn, now time.Time) {
 	// we need to use atomic here.
 	ci.InMsgs = atomic.LoadInt64(&client.inMsgs)
 	ci.InBytes = atomic.LoadInt64(&client.inBytes)
-
-	// If the connection is gone, too bad, we won't set TLSVersion and TLSCipher.
-	// Exclude clients that are still doing handshake so we don't block in
-	// ConnectionState().
-	if client.flags.isSet(handshakeComplete) && nc != nil {
-		conn := nc.(*tls.Conn)
-		cs := conn.ConnectionState()
-		ci.TLSVersion = tlsVersion(cs.Version)
-		ci.TLSCipher = tlsCipher(cs.CipherSuite)
-	}
-
-	if client.port != 0 {
-		ci.Port = int(client.port)
-		ci.IP = client.host
-	}
 }
 
 // Assume lock is held
@@ -651,8 +631,6 @@ type RouteInfo struct {
 	RemoteID     string             `json:"remote_id"`
 	DidSolicit   bool               `json:"did_solicit"`
 	IsConfigured bool               `json:"is_configured"`
-	IP           string             `json:"ip"`
-	Port         int                `json:"port"`
 	Import       *SubjectPermission `json:"import,omitempty"`
 	Export       *SubjectPermission `json:"export,omitempty"`
 	Pending      int                `json:"pending_size"`
@@ -711,13 +689,6 @@ func (s *Server) Routez(routezOpts *RoutezOptions) (*Routez, error) {
 			} else if routezOpts.Subscriptions {
 				ri.Subs = newSubsList(r)
 			}
-		}
-
-		switch conn := r.nc.(type) {
-		case *net.TCPConn, *tls.Conn:
-			addr := conn.RemoteAddr().(*net.TCPAddr)
-			ri.Port = addr.Port
-			ri.IP = addr.IP.String()
 		}
 		r.mu.Unlock()
 		rs.Routes = append(rs.Routes, ri)
@@ -989,22 +960,15 @@ type Varz struct {
 	Proto             int               `json:"proto"`
 	GitCommit         string            `json:"git_commit,omitempty"`
 	GoVersion         string            `json:"go"`
-	Host              string            `json:"host"`
-	Port              int               `json:"port"`
 	AuthRequired      bool              `json:"auth_required,omitempty"`
 	TLSRequired       bool              `json:"tls_required,omitempty"`
 	TLSVerify         bool              `json:"tls_verify,omitempty"`
-	IP                string            `json:"ip,omitempty"`
 	ClientConnectURLs []string          `json:"connect_urls,omitempty"`
 	WSConnectURLs     []string          `json:"ws_connect_urls,omitempty"`
 	MaxConn           int               `json:"max_connections"`
 	MaxSubs           int               `json:"max_subscriptions,omitempty"`
 	PingInterval      time.Duration     `json:"ping_interval"`
 	MaxPingsOut       int               `json:"ping_max"`
-	HTTPHost          string            `json:"http_host"`
-	HTTPPort          int               `json:"http_port"`
-	HTTPBasePath      string            `json:"http_base_path"`
-	HTTPSPort         int               `json:"https_port"`
 	AuthTimeout       float64           `json:"auth_timeout"`
 	MaxControlLine    int32             `json:"max_control_line"`
 	MaxPayload        int               `json:"max_payload"`
@@ -1048,20 +1012,14 @@ type JetStreamVarz struct {
 // ClusterOptsVarz contains monitoring cluster information
 type ClusterOptsVarz struct {
 	Name        string   `json:"name,omitempty"`
-	Host        string   `json:"addr,omitempty"`
-	Port        int      `json:"cluster_port,omitempty"`
 	AuthTimeout float64  `json:"auth_timeout,omitempty"`
-	URLs        []string `json:"urls,omitempty"`
+	RoutePeers  []string `json:"route_peers,omitempty"`
 }
 
 // GatewayOptsVarz contains monitoring gateway information
 type GatewayOptsVarz struct {
 	Name           string                  `json:"name,omitempty"`
-	Host           string                  `json:"host,omitempty"`
-	Port           int                     `json:"port,omitempty"`
 	AuthTimeout    float64                 `json:"auth_timeout,omitempty"`
-	TLSTimeout     float64                 `json:"tls_timeout,omitempty"`
-	Advertise      string                  `json:"advertise,omitempty"`
 	ConnectRetries int                     `json:"connect_retries,omitempty"`
 	Gateways       []RemoteGatewayOptsVarz `json:"gateways,omitempty"`
 	RejectUnknown  bool                    `json:"reject_unknown,omitempty"`
@@ -1069,25 +1027,20 @@ type GatewayOptsVarz struct {
 
 // RemoteGatewayOptsVarz contains monitoring remote gateway information
 type RemoteGatewayOptsVarz struct {
-	Name       string   `json:"name"`
-	TLSTimeout float64  `json:"tls_timeout,omitempty"`
-	URLs       []string `json:"urls,omitempty"`
+	Name string   `json:"name"`
+	URLs []string `json:"urls,omitempty"`
 }
 
 // LeafNodeOptsVarz contains monitoring leaf node information
 type LeafNodeOptsVarz struct {
-	Host        string               `json:"host,omitempty"`
-	Port        int                  `json:"port,omitempty"`
 	AuthTimeout float64              `json:"auth_timeout,omitempty"`
-	TLSTimeout  float64              `json:"tls_timeout,omitempty"`
 	Remotes     []RemoteLeafOptsVarz `json:"remotes,omitempty"`
 }
 
 // RemoteLeafOptsVarz contains monitoring remote leaf node information
 type RemoteLeafOptsVarz struct {
-	LocalAccount string   `json:"local_account,omitempty"`
-	TLSTimeout   float64  `json:"tls_timeout,omitempty"`
-	URLs         []string `json:"urls,omitempty"`
+	LocalAccount  string `json:"local_account,omitempty"`
+	RemoteAccount string `json:"remote_account,omitempty"`
 }
 
 // VarzOptions are the options passed to Varz().
@@ -1120,7 +1073,7 @@ func myUptime(d time.Duration) string {
 // HandleRoot will show basic info and links to others handlers.
 func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 	// This feels dumb to me, but is required: https://code.google.com/p/go/issues/detail?id=4799
-	if r.URL.Path != s.httpBasePath {
+	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
@@ -1148,12 +1101,12 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
     <a href=https://docs.nats.io/nats-server/configuration/monitoring.html>help</a>
   </body>
 </html>`,
-		s.basePath(VarzPath),
-		s.basePath(ConnzPath),
-		s.basePath(RoutezPath),
-		s.basePath(GatewayzPath),
-		s.basePath(LeafzPath),
-		s.basePath(SubszPath),
+		(VarzPath),
+		(ConnzPath),
+		(RoutezPath),
+		(GatewayzPath),
+		(LeafzPath),
+		(SubszPath),
 	)
 }
 
@@ -1184,41 +1137,25 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 	gw := &opts.Gateway
 	ln := &opts.LeafNode
 	varz := &Varz{
-		ID:           info.ID,
-		Version:      info.Version,
-		Proto:        info.Proto,
-		GitCommit:    info.GitCommit,
-		GoVersion:    info.GoVersion,
-		Name:         info.Name,
-		Host:         info.Host,
-		Port:         info.Port,
-		IP:           info.IP,
-		HTTPHost:     opts.HTTPHost,
-		HTTPPort:     opts.HTTPPort,
-		HTTPBasePath: opts.HTTPBasePath,
-		HTTPSPort:    opts.HTTPSPort,
+		ID:        info.ID,
+		Version:   info.Version,
+		Proto:     info.Proto,
+		GitCommit: info.GitCommit,
+		GoVersion: info.GoVersion,
+		Name:      info.Name,
 		Cluster: ClusterOptsVarz{
 			Name:        info.Cluster,
-			Host:        c.Host,
-			Port:        c.Port,
 			AuthTimeout: c.AuthTimeout,
 		},
 		Gateway: GatewayOptsVarz{
 			Name:           gw.Name,
-			Host:           gw.Host,
-			Port:           gw.Port,
 			AuthTimeout:    gw.AuthTimeout,
-			TLSTimeout:     gw.TLSTimeout,
-			Advertise:      gw.Advertise,
 			ConnectRetries: gw.ConnectRetries,
 			Gateways:       []RemoteGatewayOptsVarz{},
 			RejectUnknown:  gw.RejectUnknown,
 		},
 		LeafNode: LeafNodeOptsVarz{
-			Host:        ln.Host,
-			Port:        ln.Port,
 			AuthTimeout: ln.AuthTimeout,
-			TLSTimeout:  ln.TLSTimeout,
 			Remotes:     []RemoteLeafOptsVarz{},
 		},
 		Start:    s.start,
@@ -1226,15 +1163,14 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 		Cores:    numCores,
 		MaxProcs: maxProcs,
 	}
-	if len(opts.Routes) > 0 {
-		varz.Cluster.URLs = urlsToStrings(opts.Routes)
+	if len(opts.RoutePeers) > 0 {
+		varz.Cluster.RoutePeers = opts.RoutePeers
 	}
 	if l := len(gw.Gateways); l > 0 {
 		rgwa := make([]RemoteGatewayOptsVarz, l)
 		for i, r := range gw.Gateways {
 			rgwa[i] = RemoteGatewayOptsVarz{
-				Name:       r.Name,
-				TLSTimeout: r.TLSTimeout,
+				Name: r.Name,
 			}
 		}
 		varz.Gateway.Gateways = rgwa
@@ -1243,9 +1179,8 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 		rlna := make([]RemoteLeafOptsVarz, l)
 		for i, r := range ln.Remotes {
 			rlna[i] = RemoteLeafOptsVarz{
-				LocalAccount: r.LocalAccount,
-				URLs:         urlsToStrings(r.URLs),
-				TLSTimeout:   r.TLSTimeout,
+				LocalAccount:  r.LocalAccount,
+				RemoteAccount: r.Name,
 			}
 		}
 		varz.LeafNode.Remotes = rlna
@@ -1287,8 +1222,8 @@ func (s *Server) updateVarzConfigReloadableFields(v *Varz) {
 	opts := s.getOpts()
 	info := &s.info
 	v.AuthRequired = info.AuthRequired
-	v.TLSRequired = info.TLSRequired
-	v.TLSVerify = info.TLSVerify
+	// v.TLSRequired = info.TLSRequired
+	// v.TLSVerify = info.TLSVerify
 	v.MaxConn = opts.MaxConn
 	v.PingInterval = opts.PingInterval
 	v.MaxPingsOut = opts.MaxPingsOut
@@ -1296,12 +1231,12 @@ func (s *Server) updateVarzConfigReloadableFields(v *Varz) {
 	v.MaxControlLine = opts.MaxControlLine
 	v.MaxPayload = int(opts.MaxPayload)
 	v.MaxPending = opts.MaxPending
-	v.TLSTimeout = opts.TLSTimeout
+	// v.TLSTimeout = opts.TLSTimeout
 	v.WriteDeadline = opts.WriteDeadline
 	v.ConfigLoadTime = s.configTime
 	// Update route URLs if applicable
 	if s.varzUpdateRouteURLs {
-		v.Cluster.URLs = urlsToStrings(opts.Routes)
+		v.Cluster.RoutePeers = opts.RoutePeers
 		s.varzUpdateRouteURLs = false
 	}
 }
@@ -1315,12 +1250,14 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 	v.Uptime = myUptime(time.Since(s.start))
 	v.Mem = rss
 	v.CPU = pcpu
-	if l := len(s.info.ClientConnectURLs); l > 0 {
-		v.ClientConnectURLs = append([]string(nil), s.info.ClientConnectURLs...)
-	}
-	if l := len(s.info.WSConnectURLs); l > 0 {
-		v.WSConnectURLs = append([]string(nil), s.info.WSConnectURLs...)
-	}
+	/*
+		if l := len(s.info.ClientConnectURLs); l > 0 {
+			v.ClientConnectURLs = append([]string(nil), s.info.ClientConnectURLs...)
+		}
+		if l := len(s.info.WSConnectURLs); l > 0 {
+			v.WSConnectURLs = append([]string(nil), s.info.WSConnectURLs...)
+		}
+	*/
 	v.Connections = len(s.clients)
 	v.TotalConnections = s.totalClients
 	v.Routes = len(s.routes)
@@ -1357,9 +1294,11 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 					// rgw.urls is a map[string]*url.URL where the key is
 					// already in the right format (host:port, without any
 					// user info present).
-					for u := range rgw.urls {
-						g.URLs = append(g.URLs, u)
-					}
+					/*
+						for u := range rgw.urls {
+							g.URLs = append(g.URLs, u)
+						}
+					*/
 					rgw.varzUpdateURLs = false
 				}
 				rgw.RUnlock()
@@ -1475,8 +1414,8 @@ func (s *Server) Gatewayz(opts *GatewayzOptions) (*Gatewayz, error) {
 		ID:   srvID,
 		Now:  now,
 		Name: gw.name,
-		Host: gw.info.Host,
-		Port: gw.info.Port,
+		// Host: gw.info.Host,
+		// Port: gw.info.Port,
 	}
 	gw.RUnlock()
 
@@ -1742,8 +1681,6 @@ type LeafzOptions struct {
 // LeafInfo has detailed information on each remote leafnode connection.
 type LeafInfo struct {
 	Account  string   `json:"account"`
-	IP       string   `json:"ip"`
-	Port     int      `json:"port"`
 	RTT      string   `json:"rtt,omitempty"`
 	InMsgs   int64    `json:"in_msgs"`
 	OutMsgs  int64    `json:"out_msgs"`
@@ -1773,8 +1710,6 @@ func (s *Server) Leafz(opts *LeafzOptions) (*Leafz, error) {
 			ln.mu.Lock()
 			lni := &LeafInfo{
 				Account:  ln.acc.Name,
-				IP:       ln.host,
-				Port:     int(ln.port),
 				RTT:      ln.getRTT(),
 				InMsgs:   atomic.LoadInt64(&ln.inMsgs),
 				OutMsgs:  ln.outMsgs,

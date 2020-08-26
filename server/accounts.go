@@ -831,7 +831,6 @@ type LatencyClient struct {
 	Name    string        `json:"name,omitempty"`
 	Lang    string        `json:"lang,omitempty"`
 	Version string        `json:"ver,omitempty"`
-	IP      string        `json:"ip,omitempty"`
 	CID     uint64        `json:"cid,omitempty"`
 	Server  string        `json:"server,omitempty"`
 }
