@@ -16,19 +16,16 @@ package server
 import (
 	"bufio"
 	"bytes"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net"
 	"net/url"
-	"reflect"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -78,8 +75,6 @@ type leaf struct {
 type leafNodeCfg struct {
 	sync.RWMutex
 	*RemoteLeafOpts
-	urls      []*url.URL
-	curURL    *url.URL
 	tlsName   string
 	username  string
 	password  string
@@ -112,8 +107,7 @@ func (s *Server) solicitLeafNodeRemotes(remotes []*RemoteLeafOpts) {
 
 func (s *Server) remoteLeafNodeStillValid(remote *leafNodeCfg) bool {
 	for _, ri := range s.getOpts().LeafNode.Remotes {
-		// FIXME(dlc) - What about auth changes?
-		if reflect.DeepEqual(ri.URLs, remote.URLs) {
+		if ri.Name == remote.Name {
 			return true
 		}
 	}
@@ -122,39 +116,13 @@ func (s *Server) remoteLeafNodeStillValid(remote *leafNodeCfg) bool {
 
 // Ensure that leafnode is properly configured.
 func validateLeafNode(o *Options) error {
-	if err := validateLeafNodeAuthOptions(o); err != nil {
-		return err
-	}
-	if o.LeafNode.Port == 0 {
-		return nil
-	}
-	if o.Gateway.Name == "" && o.Gateway.Port == 0 {
+	if o.Gateway.Name == "" {
 		return nil
 	}
 	// If we are here we have both leaf nodes and gateways defined, make sure there
 	// is a system account defined.
 	if o.SystemAccount == "" {
 		return fmt.Errorf("leaf nodes and gateways (both being defined) require a system account to also be configured")
-	}
-	return nil
-}
-
-// Used to validate user names in LeafNode configuration.
-// - rejects mix of single and multiple users.
-// - rejects duplicate user names.
-func validateLeafNodeAuthOptions(o *Options) error {
-	if len(o.LeafNode.Users) == 0 {
-		return nil
-	}
-	if o.LeafNode.Username != _EMPTY_ {
-		return fmt.Errorf("can not have a single user/pass and a users array")
-	}
-	users := map[string]struct{}{}
-	for _, u := range o.LeafNode.Users {
-		if _, exists := users[u.Username]; exists {
-			return fmt.Errorf("duplicate user %q detected in leafnode authorization", u.Username)
-		}
-		users[u.Username] = struct{}{}
 	}
 	return nil
 }
@@ -174,7 +142,6 @@ func (s *Server) reConnectToRemoteLeafNode(remote *leafNodeCfg) {
 func newLeafNodeCfg(remote *RemoteLeafOpts) *leafNodeCfg {
 	cfg := &leafNodeCfg{
 		RemoteLeafOpts: remote,
-		urls:           make([]*url.URL, 0, len(remote.URLs)),
 	}
 	if len(remote.DenyExports) > 0 || len(remote.DenyImports) > 0 {
 		perms := &Permissions{}
@@ -186,39 +153,7 @@ func newLeafNodeCfg(remote *RemoteLeafOpts) *leafNodeCfg {
 		}
 		cfg.perms = perms
 	}
-	// Start with the one that is configured. We will add to this
-	// array when receiving async leafnode INFOs.
-	cfg.urls = append(cfg.urls, cfg.URLs...)
-	// If we are TLS make sure we save off a proper servername if possible.
-	// Do same for user/password since we may need them to connect to
-	// a bare URL that we get from INFO protocol.
-	for _, u := range cfg.urls {
-		cfg.saveTLSHostname(u)
-		cfg.saveUserPassword(u)
-	}
 	return cfg
-}
-
-// Will pick an URL from the list of available URLs.
-func (cfg *leafNodeCfg) pickNextURL() *url.URL {
-	cfg.Lock()
-	defer cfg.Unlock()
-	// If the current URL is the first in the list and we have more than
-	// one URL, then move that one to end of the list.
-	if cfg.curURL != nil && len(cfg.urls) > 1 && urlsAreEqual(cfg.curURL, cfg.urls[0]) {
-		first := cfg.urls[0]
-		copy(cfg.urls, cfg.urls[1:])
-		cfg.urls[len(cfg.urls)-1] = first
-	}
-	cfg.curURL = cfg.urls[0]
-	return cfg.curURL
-}
-
-// Returns the current URL
-func (cfg *leafNodeCfg) getCurrentURL() *url.URL {
-	cfg.RLock()
-	defer cfg.RUnlock()
-	return cfg.curURL
 }
 
 // Returns how long the server should wait before attempting
@@ -237,35 +172,16 @@ func (cfg *leafNodeCfg) setConnectDelay(delay time.Duration) {
 	cfg.Unlock()
 }
 
-// Ensure that non-exported options (used in tests) have
-// been properly set.
-func (s *Server) setLeafNodeNonExportedOptions() {
-	opts := s.getOpts()
-	s.leafNodeOpts.dialTimeout = opts.LeafNode.dialTimeout
-	if s.leafNodeOpts.dialTimeout == 0 {
-		// Use same timeouts as routes for now.
-		s.leafNodeOpts.dialTimeout = DEFAULT_ROUTE_DIAL
-	}
-	s.leafNodeOpts.resolver = opts.LeafNode.resolver
-	if s.leafNodeOpts.resolver == nil {
-		s.leafNodeOpts.resolver = net.DefaultResolver
-	}
-}
-
 func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool) {
 	defer s.grWG.Done()
 
-	if remote == nil || len(remote.URLs) == 0 {
-		s.Debugf("Empty remote leafnode definition, nothing to connect")
+	if remote == nil || len(remote.Name) == 0 {
+		s.Debugf("Empty remote leafnode definition or definition name, nothing to connect")
 		return
 	}
 
 	opts := s.getOpts()
 	reconnectDelay := opts.LeafNode.ReconnectInterval
-	s.mu.Lock()
-	dialTimeout := s.leafNodeOpts.dialTimeout
-	resolver := s.leafNodeOpts.resolver
-	s.mu.Unlock()
 
 	if connDelay := remote.getConnectDelay(); connDelay > 0 {
 		select {
@@ -282,22 +198,13 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 
 	attempts := 0
 	for s.isRunning() && s.remoteLeafNodeStillValid(remote) {
-		rURL := remote.pickNextURL()
-		url, err := s.getRandomIP(resolver, rURL.Host)
-		if err == nil {
-			var ipStr string
-			if url != rURL.Host {
-				ipStr = fmt.Sprintf(" (%s)", url)
-			}
-			s.Debugf("Trying to connect as leafnode to remote server on %q%s", rURL.Host, ipStr)
-			conn, err = natsDialTimeout("tcp", url, dialTimeout)
-		}
+		err := errors.New("TODO EstablishLink connectToRemoteLeafNode nats")
 		if err != nil {
 			attempts++
 			if s.shouldReportConnectErr(firstConnect, attempts) {
-				s.Errorf(connErrFmt, rURL.Host, attempts, err)
+				s.Errorf(connErrFmt, remote.Name, attempts, err)
 			} else {
-				s.Debugf(connErrFmt, rURL.Host, attempts, err)
+				s.Debugf(connErrFmt, remote.Name, attempts, err)
 			}
 			select {
 			case <-s.quitCh:
@@ -317,19 +224,10 @@ func (s *Server) connectToRemoteLeafNode(remote *leafNodeCfg, firstConnect bool)
 
 		// We will put this in the normal log if first connect, does not force -DV mode to know
 		// that the connect worked.
-		if firstConnect {
-			s.Noticef("Connected leafnode to %q", rURL.Host)
-		}
+		// if firstConnect {
+		s.Noticef("Connected leafnode to %q", remote.Name)
+		// }
 		return
-	}
-}
-
-// Save off the tlsName for when we use TLS and mix hostnames and IPs. IPs usually
-// come from the server we connect to.
-func (cfg *leafNodeCfg) saveTLSHostname(u *url.URL) {
-	isTLS := cfg.TLSConfig != nil || u.Scheme == "tls"
-	if isTLS && cfg.tlsName == "" && net.ParseIP(u.Hostname()) == nil {
-		cfg.tlsName = u.Hostname()
 	}
 }
 
@@ -346,82 +244,39 @@ func (cfg *leafNodeCfg) saveUserPassword(u *url.URL) {
 // is detected that the server has already been shutdown.
 func (s *Server) startLeafNodeAcceptLoop() {
 	// Snapshot server options.
-	opts := s.getOpts()
+	// opts := s.getOpts()
 
-	port := opts.LeafNode.Port
-	if port == -1 {
-		port = 0
-	}
+	/*
+		port := opts.LeafNode.Port
+		if port == -1 {
+			port = 0
+		}
+	*/
 
 	s.mu.Lock()
 	if s.shutdown {
 		s.mu.Unlock()
 		return
 	}
-	hp := net.JoinHostPort(opts.LeafNode.Host, strconv.Itoa(port))
-	l, e := natsListen("tcp", hp)
-	if e != nil {
-		s.mu.Unlock()
-		s.Fatalf("Error listening on leafnode port: %d - %v", opts.LeafNode.Port, e)
-		return
-	}
 
-	s.Noticef("Listening for leafnode connections on %s",
-		net.JoinHostPort(opts.LeafNode.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
+	s.Noticef("Listening for leafnode connections on internal mux")
 
-	tlsRequired := opts.LeafNode.TLSConfig != nil
-	tlsVerify := tlsRequired && opts.LeafNode.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert
 	info := Info{
-		ID:           s.info.ID,
-		Version:      s.info.Version,
-		GitCommit:    gitCommit,
-		GoVersion:    runtime.Version(),
-		AuthRequired: true,
-		TLSRequired:  tlsRequired,
-		TLSVerify:    tlsVerify,
-		MaxPayload:   s.info.MaxPayload, // TODO(dlc) - Allow override?
-		Headers:      s.supportsHeaders(),
-		Proto:        1, // Fixed for now.
-	}
-	// If we have selected a random port...
-	if port == 0 {
-		// Write resolved port back to options.
-		opts.LeafNode.Port = l.Addr().(*net.TCPAddr).Port
+		ID:         s.info.ID,
+		Version:    s.info.Version,
+		GitCommit:  gitCommit,
+		GoVersion:  runtime.Version(),
+		MaxPayload: s.info.MaxPayload, // TODO(dlc) - Allow override?
+		Headers:    s.supportsHeaders(),
+		Proto:      1, // Fixed for now.
 	}
 
 	s.leafNodeInfo = info
-	// Possibly override Host/Port and set IP based on Cluster.Advertise
-	if err := s.setLeafNodeInfoHostPortAndIP(); err != nil {
-		s.Fatalf("Error setting leafnode INFO with LeafNode.Advertise value of %s, err=%v", s.opts.LeafNode.Advertise, err)
-		l.Close()
-		s.mu.Unlock()
-		return
-	}
-	s.leafURLsMap[s.leafNodeInfo.IP]++
+	// s.leafURLsMap[s.leafNodeInfo.IP]++
 	s.generateLeafNodeInfoJSON()
 
-	// Setup state that can enable shutdown
-	s.leafNodeListener = l
-
-	// As of now, a server that does not have remotes configured would
-	// never solicit a connection, so we should not have to warn if
-	// InsecureSkipVerify is set in main LeafNodes config (since
-	// this TLS setting matters only when soliciting a connection).
-	// Still, warn if insecure is set in any of LeafNode block.
-	// We need to check remotes, even if tls is not required on accept.
-	warn := tlsRequired && opts.LeafNode.TLSConfig.InsecureSkipVerify
-	if !warn {
-		for _, r := range opts.LeafNode.Remotes {
-			if r.TLSConfig != nil && r.TLSConfig.InsecureSkipVerify {
-				warn = true
-				break
-			}
-		}
-	}
-	if warn {
-		s.Warnf(leafnodeTLSInsecureWarning)
-	}
-	go s.acceptConnections(l, "Leafnode", func(conn net.Conn) { s.createLeafNode(conn, nil) }, nil)
+	// s.leafNodeListener = l
+	// go s.acceptConnections(l, "Leafnode", func(conn net.Conn) { s.createLeafNode(conn, nil) }, nil)
 	s.mu.Unlock()
 }
 
@@ -429,10 +284,10 @@ func (s *Server) startLeafNodeAcceptLoop() {
 var credsRe = regexp.MustCompile(`\s*(?:(?:[-]{3,}[^\n]*[-]{3,}\n)(.+)(?:\n\s*[-]{3,}[^\n]*[-]{3,}\n))`)
 
 // Lock should be held entering here.
-func (c *client) sendLeafConnect(clusterName string, tlsRequired bool) error {
+func (c *client) sendLeafConnect(clusterName string) error {
 	// We support basic user/pass and operator based user JWT with signatures.
 	cinfo := leafConnectInfo{
-		TLS:     tlsRequired,
+		// TLS:     tlsRequired,
 		Name:    c.srv.info.ID,
 		Hub:     c.leaf.remote.Hub,
 		Cluster: clusterName,
@@ -470,9 +325,6 @@ func (c *client) sendLeafConnect(clusterName string, tlsRequired bool) error {
 		sig := base64.RawURLEncoding.EncodeToString(sigraw)
 		cinfo.JWT = string(tmp)
 		cinfo.Sig = sig
-	} else if userInfo := c.leaf.remote.curURL.User; userInfo != nil {
-		cinfo.User = userInfo.Username()
-		cinfo.Pass, _ = userInfo.Password()
 	} else if c.leaf.remote.username != _EMPTY_ {
 		cinfo.User = c.leaf.remote.username
 		cinfo.Pass = c.leaf.remote.password
@@ -493,45 +345,11 @@ func (c *client) sendLeafConnect(clusterName string, tlsRequired bool) error {
 // The server lock is held on entry.
 func (s *Server) copyLeafNodeInfo() *Info {
 	clone := s.leafNodeInfo
-	// Copy the array of urls.
-	if len(s.leafNodeInfo.LeafNodeURLs) > 0 {
-		clone.LeafNodeURLs = append([]string(nil), s.leafNodeInfo.LeafNodeURLs...)
-	}
 	return &clone
-}
-
-// Adds a LeafNode URL that we get when a route connects to the Info structure.
-// Regenerates the JSON byte array so that it can be sent to LeafNode connections.
-// Returns a boolean indicating if the URL was added or not.
-// Server lock is held on entry
-func (s *Server) addLeafNodeURL(urlStr string) bool {
-	if s.leafURLsMap.addUrl(urlStr) {
-		s.generateLeafNodeInfoJSON()
-		return true
-	}
-	return false
-}
-
-// Removes a LeafNode URL of the route that is disconnecting from the Info structure.
-// Regenerates the JSON byte array so that it can be sent to LeafNode connections.
-// Returns a boolean indicating if the URL was removed or not.
-// Server lock is held on entry.
-func (s *Server) removeLeafNodeURL(urlStr string) bool {
-	// Don't need to do this if we are removing the route connection because
-	// we are shuting down...
-	if s.shutdown {
-		return false
-	}
-	if s.leafURLsMap.removeUrl(urlStr) {
-		s.generateLeafNodeInfoJSON()
-		return true
-	}
-	return false
 }
 
 // Server lock is held on entry
 func (s *Server) generateLeafNodeInfoJSON() {
-	s.leafNodeInfo.LeafNodeURLs = s.leafURLsMap.getAsStringSlice()
 	b, _ := json.Marshal(s.leafNodeInfo)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
 	s.leafNodeInfoJSON = bytes.Join(pcs, []byte(" "))
@@ -649,72 +467,7 @@ func (s *Server) createLeafNode(conn net.Conn, remote *leafNodeCfg) *client {
 			return nil
 		}
 
-		// Do TLS here as needed.
-		tlsRequired := remote.TLS || remote.TLSConfig != nil
-		if tlsRequired {
-			c.Debugf("Starting TLS leafnode client handshake")
-			// Specify the ServerName we are expecting.
-			var tlsConfig *tls.Config
-			if remote.TLSConfig != nil {
-				tlsConfig = remote.TLSConfig.Clone()
-			} else {
-				tlsConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-			}
-
-			var host string
-			// If ServerName was given to us from the option, use that, always.
-			if tlsConfig.ServerName == "" {
-				url := remote.getCurrentURL()
-				host = url.Hostname()
-				// We need to check if this host is an IP. If so, we probably
-				// had this advertised to us and should use the configured host
-				// name for the TLS server name.
-				if remote.tlsName != "" && net.ParseIP(host) != nil {
-					host = remote.tlsName
-				}
-				tlsConfig.ServerName = host
-			}
-
-			c.nc = tls.Client(c.nc, tlsConfig)
-
-			conn := c.nc.(*tls.Conn)
-
-			// Setup the timeout
-			var wait time.Duration
-			if remote.TLSTimeout == 0 {
-				wait = TLS_TIMEOUT
-			} else {
-				wait = secondsToDuration(remote.TLSTimeout)
-			}
-			time.AfterFunc(wait, func() { tlsTimeout(c, conn) })
-			conn.SetReadDeadline(time.Now().Add(wait))
-
-			// Force handshake
-			c.mu.Unlock()
-			if err = conn.Handshake(); err != nil {
-				// If we overrode and used the saved tlsName but that failed
-				// we will clear that here. This is for the case that another server
-				// does not have the same tlsName, maybe only IPs.
-				// https://github.com/nats-io/nats-server/issues/1256
-				if _, ok := err.(x509.HostnameError); ok {
-					remote.Lock()
-					if host == remote.tlsName {
-						remote.tlsName = ""
-					}
-					remote.Unlock()
-				}
-				c.Errorf("TLS handshake error: %v", err)
-				c.closeConnection(TLSHandshakeError)
-				return nil
-			}
-			// Reset the read deadline
-			conn.SetReadDeadline(time.Time{})
-
-			// Re-Grab lock
-			c.mu.Lock()
-		}
-
-		if err := c.sendLeafConnect(clusterName, tlsRequired); err != nil {
+		if err := c.sendLeafConnect(clusterName); err != nil {
 			c.mu.Unlock()
 			c.closeConnection(ProtocolViolation)
 			return nil
@@ -735,41 +488,6 @@ func (s *Server) createLeafNode(conn net.Conn, remote *leafNodeCfg) *client {
 		// writeLoop go routine. The other side needs to receive
 		// this before it can initiate the TLS handshake..
 		c.sendProtoNow(bytes.Join(pcs, []byte(" ")))
-
-		// Check to see if we need to spin up TLS.
-		if info.TLSRequired {
-			c.Debugf("Starting TLS leafnode server handshake")
-			c.nc = tls.Server(c.nc, opts.LeafNode.TLSConfig)
-			conn := c.nc.(*tls.Conn)
-
-			// Setup the timeout
-			ttl := secondsToDuration(opts.LeafNode.TLSTimeout)
-			time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
-			conn.SetReadDeadline(time.Now().Add(ttl))
-
-			// Force handshake
-			c.mu.Unlock()
-			if err := conn.Handshake(); err != nil {
-				c.Errorf("TLS handshake error: %v", err)
-				c.closeConnection(TLSHandshakeError)
-				return nil
-			}
-			// Reset the read deadline
-			conn.SetReadDeadline(time.Time{})
-
-			// Re-Grab lock
-			c.mu.Lock()
-
-			// Indicate that handshake is complete (used in monitoring)
-			c.flags.set(handshakeComplete)
-		}
-
-		// Leaf nodes will always require a CONNECT to let us know
-		// when we are properly bound to an account.
-		// The connection may have been closed
-		if !c.isClosed() {
-			c.setAuthTimer(secondsToDuration(opts.LeafNode.AuthTimeout))
-		}
 	}
 
 	// Keep track in case server is shutdown before we can successfully register.
@@ -785,9 +503,6 @@ func (s *Server) createLeafNode(conn net.Conn, remote *leafNodeCfg) *client {
 
 	// Spin up the write loop.
 	s.startGoRoutine(func() { c.writeLoop() })
-
-	// Set the Ping timer
-	s.setFirstPingTimer(c)
 
 	c.mu.Unlock()
 
@@ -856,23 +571,13 @@ func (c *client) processLeafnodeInfo(info *Info) error {
 		// As seen from above, a solicited LeafNode connection should receive
 		// from the remote server an INFO with CID and LeafNodeURLs. Anything
 		// else should be considered an attempt to connect to a wrong port.
-		if c.leaf.remote != nil && (info.CID == 0 || info.LeafNodeURLs == nil) {
+		if c.leaf.remote != nil && info.CID == 0 {
 			return ErrConnectedToWrongPort
 		}
 		// Capture a nonce here.
 		c.nonce = []byte(info.Nonce)
-		if info.TLSRequired && c.leaf.remote != nil {
-			c.leaf.remote.TLS = true
-		}
 		supportsHeaders := c.srv.supportsHeaders()
 		c.headers = supportsHeaders && info.Headers
-	}
-	// For both initial INFO and async INFO protocols, Possibly
-	// update our list of remote leafnode URLs we can connect to.
-	if c.leaf.remote != nil && len(info.LeafNodeURLs) > 0 {
-		// Consider the incoming array as the most up-to-date
-		// representation of the remote cluster's list of URLs.
-		c.updateLeafNodeURLs(info)
 	}
 
 	// Check to see if we have permissions updates here.
@@ -893,78 +598,6 @@ func (c *client) processLeafnodeInfo(info *Info) error {
 		c.setPermissions(perms)
 	}
 
-	return nil
-}
-
-// When getting a leaf node INFO protocol, use the provided
-// array of urls to update the list of possible endpoints.
-func (c *client) updateLeafNodeURLs(info *Info) {
-	cfg := c.leaf.remote
-	cfg.Lock()
-	defer cfg.Unlock()
-
-	cfg.urls = make([]*url.URL, 0, 1+len(info.LeafNodeURLs))
-	// Add the ones we receive in the protocol
-	for _, surl := range info.LeafNodeURLs {
-		url, err := url.Parse("nats-leaf://" + surl)
-		if err != nil {
-			c.Errorf("Error parsing url %q: %v", surl, err)
-			continue
-		}
-		// Do not add if it's the same as what we already have configured.
-		var dup bool
-		for _, u := range cfg.URLs {
-			// URLs that we receive never have user info, but the
-			// ones that were configured may have. Simply compare
-			// host and port to decide if they are equal or not.
-			if url.Host == u.Host && url.Port() == u.Port() {
-				dup = true
-				break
-			}
-		}
-		if !dup {
-			cfg.urls = append(cfg.urls, url)
-			cfg.saveTLSHostname(url)
-		}
-	}
-	// Add the configured one
-	cfg.urls = append(cfg.urls, cfg.URLs...)
-}
-
-// Similar to setInfoHostPortAndGenerateJSON, but for leafNodeInfo.
-func (s *Server) setLeafNodeInfoHostPortAndIP() error {
-	opts := s.getOpts()
-	if opts.LeafNode.Advertise != _EMPTY_ {
-		advHost, advPort, err := parseHostPort(opts.LeafNode.Advertise, opts.LeafNode.Port)
-		if err != nil {
-			return err
-		}
-		s.leafNodeInfo.Host = advHost
-		s.leafNodeInfo.Port = advPort
-	} else {
-		s.leafNodeInfo.Host = opts.LeafNode.Host
-		s.leafNodeInfo.Port = opts.LeafNode.Port
-		// If the host is "0.0.0.0" or "::" we need to resolve to a public IP.
-		// This will return at most 1 IP.
-		hostIsIPAny, ips, err := s.getNonLocalIPsIfHostIsIPAny(s.leafNodeInfo.Host, false)
-		if err != nil {
-			return err
-		}
-		if hostIsIPAny {
-			if len(ips) == 0 {
-				s.Errorf("Could not find any non-local IP for leafnode's listen specification %q",
-					s.leafNodeInfo.Host)
-			} else {
-				// Take the first from the list...
-				s.leafNodeInfo.Host = ips[0]
-			}
-		}
-	}
-	// Use just host:port for the IP
-	s.leafNodeInfo.IP = net.JoinHostPort(s.leafNodeInfo.Host, strconv.Itoa(s.leafNodeInfo.Port))
-	if opts.LeafNode.Advertise != _EMPTY_ {
-		s.Noticef("Advertise address for leafnode is set to %s", s.leafNodeInfo.IP)
-	}
 	return nil
 }
 
@@ -1827,11 +1460,6 @@ func (c *client) leafProcessErr(errStr string) {
 func (c *client) setLeafConnectDelayIfSoliciting(delay time.Duration) (string, time.Duration) {
 	c.mu.Lock()
 	if c.isSolicitedLeafNode() {
-		if s := c.srv; s != nil {
-			if srvdelay := s.getOpts().LeafNode.connDelay; srvdelay != 0 {
-				delay = srvdelay
-			}
-		}
 		c.leaf.remote.setConnectDelay(delay)
 	}
 	accName := c.acc.Name

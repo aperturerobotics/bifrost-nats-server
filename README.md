@@ -1,54 +1,43 @@
+# NATS.io V2.0
+
 ## <img src="logos/nats-server.png" width="300">
+
+----
 
 [NATS](https://nats.io) is a simple, secure and performant communications system for digital systems, services and devices. NATS is part of the Cloud Native Computing Foundation ([CNCF](https://cncf.io)). NATS has over [30 client language implementations](https://nats.io/download/), and its server can run on-premise, in the cloud, at the edge, and even on a Raspberry Pi. NATS can secure and simplify design and operation of modern distributed systems.
 
-[![License][License-Image]][License-Url] [![FOSSA Status][Fossa-Image]][Fossa-Url] [![ReportCard][ReportCard-Image]][ReportCard-Url] [![Build][Build-Status-Image]][Build-Status-Url] [![Release][Release-Image]][Release-Url] [![Coverage][Coverage-Image]][Coverage-Url] [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/1895/badge)](https://bestpractices.coreinfrastructure.org/projects/1895)
+This is the Aperture Robotics fork which adds a minimal patchset exposing the
+inner server constructors to outside api consumers, so that we can construct the
+server with a keypair created outside of Nats.
 
-## Documentation
+This version keeps the server as a library rather than a daemon.
 
-* [Official documentation](https://nats-io.github.io/docs)
-* [FAQ](https://nats-io.github.io/docs/faq)
-* Watch [a video overview of NATS](https://www.youtube.com/watch?v=sm63oAVPqAM) to learn more about its origin story and design philosophy.
+## Significant Differences from Upstream
 
-## Contact
+This is the Aperture Robotics Nats 2.0 fork, intended for integration with other
+system components. To this end, connection management, reconnections,
+encapsulated protocols (websocket), log rotation, IP address / URLs, are all
+managed by code that does not live in this repo.
 
-* [Twitter](https://twitter.com/nats_io): Follow us on Twitter!
-* [Google Groups](https://groups.google.com/forum/#!forum/natsio): Where you can ask questions
-* [Slack](https://natsio.slack.com): Click [here](https://slack.nats.io) to join. You can ask question to our maintainers and to the rich and active community.
-
-## Contributing
-
-If you are interested in contributing to NATS, read about our...
-
-* [Contributing guide](https://nats.io/community/#contribute)
-* [Report issues or propose Pull Requests](https://github.com/nats-io)
-
-[License-Url]: https://www.apache.org/licenses/LICENSE-2.0
-[License-Image]: https://img.shields.io/badge/License-Apache2-blue.svg
-[Fossa-Url]: https://app.fossa.io/projects/git%2Bgithub.com%2Fnats-io%2Fgnatsd?ref=badge_shield
-[Fossa-Image]: https://app.fossa.io/api/projects/git%2Bgithub.com%2Fnats-io%2Fgnatsd.svg?type=shield
-[Build-Status-Url]: https://travis-ci.org/nats-io/nats-server
-[Build-Status-Image]: https://travis-ci.org/nats-io/nats-server.svg?branch=master
-[Release-Url]: https://github.com/nats-io/nats-server/releases/tag/v2.1.7
-[Release-image]: https://img.shields.io/badge/release-v2.1.7-1eb0fc.svg
-[Coverage-Url]: https://coveralls.io/r/nats-io/nats-server?branch=master
-[Coverage-image]: https://coveralls.io/repos/github/nats-io/nats-server/badge.svg?branch=master
-[ReportCard-Url]: https://goreportcard.com/report/nats-io/nats-server
-[ReportCard-Image]: https://goreportcard.com/badge/github.com/nats-io/nats-server
-[github-release]: https://github.com/nats-io/nats-server/releases/
-
-## Security
-
-### Security Audit
-
-A third party security audit was performed by Cure53, you can see the full report [here](https://github.com/nats-io/nats-general/blob/master/reports/Cure53_NATS_Audit.pdf).
-
-### Reporting Security Vulnerabilities
-
-If you've found a vulnerability or a potential vulnerability in the NATS server, please let us know at
-[nats-security](mailto:security@nats.io).
+ - connection + tls: caller manages this and pass authenticated conns
+ - authentication: managed by passing pre-authenticated conns
+ - authorization: managed by Nats, without account expiration
+   - all keys that can connect as per the caller are allowed
+   - communication between accounts is controlled the usual way in NATS
+   - expiration or removal of accounts or account sessions is removed 
+ - tests: completely removed, mitigated by: 
+   - upstream is tested
+   - test downstream in e2e and integration tests
+ - websocket: completely removed
+ - configuration file syntax: completely removed (may be re-added as a package)
+ - config reload: will be re-added eventually
+ - connection management: no soliciting, route establishment gossip, conn URLs
+   - nats does not care about IP/host/URL anymore
 
 ## License
 
 Unless otherwise noted, the NATS source files are distributed
 under the Apache Version 2.0 license found in the LICENSE file.
+
+The Aperture changes list, as per the Aperture 2.0 license, are disclosed along
+with the original license with any derived software binaries.

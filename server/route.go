@@ -15,14 +15,10 @@ package server
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net"
-	"net/url"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -66,21 +62,14 @@ func setRouteProtoForTest(wantedProto int) int {
 }
 
 type route struct {
-	remoteID     string
-	remoteName   string
-	didSolicit   bool
-	retry        bool
-	lnoc         bool
-	routeType    RouteType
-	url          *url.URL
-	authRequired bool
-	tlsRequired  bool
-	connectURLs  []string
-	wsConnURLs   []string
-	replySubs    map[*subscription]*time.Timer
-	gatewayURL   string
-	leafnodeURL  string
-	hash         string
+	remoteID   string
+	remoteName string
+	didSolicit bool
+	retry      bool
+	lnoc       bool
+	routeType  RouteType
+	replySubs  map[*subscription]*time.Timer
+	hash       string
 }
 
 type connectInfo struct {
@@ -89,7 +78,6 @@ type connectInfo struct {
 	Pedantic bool   `json:"pedantic"`
 	User     string `json:"user,omitempty"`
 	Pass     string `json:"pass,omitempty"`
-	TLS      bool   `json:"tls_required"`
 	Headers  bool   `json:"headers"`
 	Name     string `json:"name"`
 	Cluster  string `json:"cluster"`
@@ -447,12 +435,8 @@ func (c *client) processInboundRoutedMsg(msg []byte) {
 }
 
 // Lock should be held entering here.
-func (c *client) sendRouteConnect(clusterName string, tlsRequired bool) error {
+func (c *client) sendRouteConnect(clusterName string) error {
 	var user, pass string
-	if userInfo := c.route.url.User; userInfo != nil {
-		user = userInfo.Username()
-		pass, _ = userInfo.Password()
-	}
 	s := c.srv
 	cinfo := connectInfo{
 		Echo:     true,
@@ -460,7 +444,6 @@ func (c *client) sendRouteConnect(clusterName string, tlsRequired bool) error {
 		Pedantic: false,
 		User:     user,
 		Pass:     pass,
-		TLS:      tlsRequired,
 		Name:     s.info.ID,
 		Headers:  s.supportsHeaders(),
 		Cluster:  clusterName,
@@ -507,6 +490,7 @@ func (c *client) processRouteInfo(info *Info) {
 		// Need to set this so that the close does the right thing
 		c.route.remoteID = info.ID
 		c.mu.Unlock()
+		c.Debugf("Detected route to self them %q == us %q", info.ID, s.info.ID)
 		c.closeConnection(DuplicateRoute)
 		return
 	}
@@ -555,13 +539,9 @@ func (c *client) processRouteInfo(info *Info) {
 			return
 		}
 
-		var connectURLs []string
-		var wsConnectURLs []string
-
 		// If we are notified that the remote is going into LDM mode, capture route's connectURLs.
 		if info.LameDuckMode {
-			connectURLs = c.route.connectURLs
-			wsConnectURLs = c.route.wsConnURLs
+			//
 		} else {
 			// If this is an update due to config reload on the remote server,
 			// need to possibly send local subs to the remote server.
@@ -572,9 +552,6 @@ func (c *client) processRouteInfo(info *Info) {
 		// If the remote is going into LDM and there are client connect URLs
 		// associated with this route and we are allowed to advertise, remove
 		// those URLs and update our clients.
-		if (len(connectURLs) > 0 || len(wsConnectURLs) > 0) && !s.getOpts().Cluster.NoAdvertise {
-			s.removeConnectURLsAndSendINFOToClients(connectURLs, wsConnectURLs)
-		}
 		return
 	}
 
@@ -589,37 +566,15 @@ func (c *client) processRouteInfo(info *Info) {
 
 	// Copy over important information.
 	c.route.remoteID = info.ID
-	c.route.authRequired = info.AuthRequired
-	c.route.tlsRequired = info.TLSRequired
-	c.route.gatewayURL = info.GatewayURL
 	c.route.remoteName = info.Name
 	c.route.lnoc = info.LNOC
 
-	// When sent through route INFO, if the field is set, it should be of size 1.
-	if len(info.LeafNodeURLs) == 1 {
-		c.route.leafnodeURL = info.LeafNodeURLs[0]
-	}
 	// Compute the hash of this route based on remoteID
 	c.route.hash = string(getHash(info.ID))
 
 	// Copy over permissions as well.
 	c.opts.Import = info.Import
 	c.opts.Export = info.Export
-
-	// If we do not know this route's URL, construct one on the fly
-	// from the information provided.
-	if c.route.url == nil {
-		// Add in the URL from host and port
-		hp := net.JoinHostPort(info.Host, strconv.Itoa(info.Port))
-		url, err := url.Parse(fmt.Sprintf("nats-route://%s/", hp))
-		if err != nil {
-			c.Errorf("Error parsing URL from INFO: %v\n", err)
-			c.mu.Unlock()
-			c.closeConnection(ParseError)
-			return
-		}
-		c.route.url = url
-	}
 
 	// Check to see if we have this remote already registered.
 	// This can happen when both servers have routes to each other.
@@ -640,27 +595,31 @@ func (c *client) processRouteInfo(info *Info) {
 			// The incoming INFO from the route will have IP set
 			// if it has Cluster.Advertise. In that case, use that
 			// otherwise contruct it from the remote TCP address.
-			if info.IP == "" {
-				// Need to get the remote IP address.
-				c.mu.Lock()
-				switch conn := c.nc.(type) {
-				case *net.TCPConn, *tls.Conn:
-					addr := conn.RemoteAddr().(*net.TCPAddr)
-					info.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(addr.IP.String(),
-						strconv.Itoa(info.Port)))
-				default:
-					info.IP = c.route.url.String()
+			/*
+				if info.IP == "" {
+					// Need to get the remote IP address.
+					c.mu.Lock()
+					switch conn := c.nc.(type) {
+					case *net.TCPConn, *tls.Conn:
+						addr := conn.RemoteAddr().(*net.TCPAddr)
+						info.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(addr.IP.String(),
+							strconv.Itoa(info.Port)))
+					default:
+						info.IP = c.route.url.String()
+					}
+					c.mu.Unlock()
 				}
-				c.mu.Unlock()
-			}
+			*/
 			// Now let the known servers know about this new route
 			s.forwardNewRouteInfoToKnownServers(info)
 		}
 		// Unless disabled, possibly update the server's INFO protocol
 		// and send to clients that know how to handle async INFOs.
-		if !s.getOpts().Cluster.NoAdvertise {
-			s.addConnectURLsAndSendINFOToClients(info.ClientConnectURLs, info.WSConnectURLs)
-		}
+		/*
+			if !s.getOpts().Cluster.NoAdvertise {
+				s.addConnectURLsAndSendINFOToClients(info.ClientConnectURLs, info.WSConnectURLs)
+			}
+		*/
 	} else {
 		c.Debugf("Detected duplicate remote route %q", info.ID)
 		c.closeConnection(DuplicateRoute)
@@ -719,7 +678,7 @@ func (s *Server) sendAsyncInfoToClients(regCli, wsCli bool) {
 		// registered (server has received CONNECT and first PING). For
 		// clients that are not at this stage, this will happen in the
 		// processing of the first PING (see client.processPing)
-		if ((regCli && c.ws == nil) || (wsCli && c.ws != nil)) &&
+		if regCli &&
 			c.opts.Protocol >= ClientProtoInfo &&
 			c.flags.isSet(firstPongSent) {
 			// sendInfo takes care of checking if the connection is still
@@ -752,29 +711,24 @@ func (s *Server) processImplicitRoute(info *Info) {
 		return
 	}
 
-	// Initiate the connection, using info.IP instead of info.URL here...
-	r, err := url.Parse(info.IP)
-	if err != nil {
-		s.Errorf("Error parsing URL from INFO: %v\n", err)
-		return
-	}
-
 	// Snapshot server options.
-	opts := s.getOpts()
+	// opts := s.getOpts()
 
-	if info.AuthRequired {
-		r.User = url.UserPassword(opts.Cluster.Username, opts.Cluster.Password)
-	}
-	s.startGoRoutine(func() { s.connectToRoute(r, false, true) })
+	/*
+		if info.AuthRequired {
+			r.User = url.UserPassword(opts.Cluster.Username, opts.Cluster.Password)
+		}
+	*/
+	// s.startGoRoutine(func() { s.connectToRoute(remoteID, false, true) })
 }
 
 // hasThisRouteConfigured returns true if info.Host:info.Port is present
 // in the server's opts.Routes, false otherwise.
 // Server lock is assumed to be held by caller.
 func (s *Server) hasThisRouteConfigured(info *Info) bool {
-	urlToCheckExplicit := strings.ToLower(net.JoinHostPort(info.Host, strconv.Itoa(info.Port)))
-	for _, ri := range s.getOpts().Routes {
-		if strings.ToLower(ri.Host) == urlToCheckExplicit {
+	urlToCheckExplicit := strings.ToLower(info.ID)
+	for _, ri := range s.getOpts().RoutePeers {
+		if strings.ToLower(ri) == urlToCheckExplicit {
 			return true
 		}
 	}
@@ -1267,15 +1221,17 @@ func (c *client) sendRouteSubOrUnSubProtos(subs []*subscription, isSubProto, tra
 	c.enqueueProto(buf)
 }
 
-func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
+func (s *Server) createRoute(conn net.Conn, remoteID string) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
-	didSolicit := rURL != nil
+	didSolicit := remoteID != ""
 	r := &route{didSolicit: didSolicit}
-	for _, route := range opts.Routes {
-		if rURL != nil && (strings.EqualFold(rURL.Host, route.Host)) {
-			r.routeType = Explicit
+	if didSolicit {
+		for _, route := range opts.RoutePeers {
+			if strings.EqualFold(remoteID, route) {
+				r.routeType = Explicit
+			}
 		}
 	}
 
@@ -1292,8 +1248,7 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	// Clear now that it has been serialized. Will prevent nonce to be included in async INFO that we may send.
 	s.routeInfo.Nonce = _EMPTY_
 	infoJSON := s.routeInfoJSON
-	authRequired := s.routeInfo.AuthRequired
-	tlsRequired := s.routeInfo.TLSRequired
+	// authRequired := s.routeInfo.AuthRequired
 	clusterName := s.info.Cluster
 	s.mu.Unlock()
 
@@ -1303,59 +1258,8 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	// Initialize
 	c.initClient()
 
-	if didSolicit {
-		// Do this before the TLS code, otherwise, in case of failure
-		// and if route is explicit, it would try to reconnect to 'nil'...
-		r.url = rURL
-	} else {
+	if !didSolicit {
 		c.flags.set(expectConnect)
-	}
-
-	// Check for TLS
-	if tlsRequired {
-		// Copy off the config to add in ServerName if we need to.
-		tlsConfig := opts.Cluster.TLSConfig.Clone()
-
-		// If we solicited, we will act like the client, otherwise the server.
-		if didSolicit {
-			c.Debugf("Starting TLS route client handshake")
-			// Specify the ServerName we are expecting.
-			host, _, _ := net.SplitHostPort(rURL.Host)
-			tlsConfig.ServerName = host
-			c.nc = tls.Client(c.nc, tlsConfig)
-		} else {
-			c.Debugf("Starting TLS route server handshake")
-			c.nc = tls.Server(c.nc, tlsConfig)
-		}
-
-		conn := c.nc.(*tls.Conn)
-
-		// Setup the timeout
-		ttl := secondsToDuration(opts.Cluster.TLSTimeout)
-		time.AfterFunc(ttl, func() { tlsTimeout(c, conn) })
-		conn.SetReadDeadline(time.Now().Add(ttl))
-
-		c.mu.Unlock()
-		if err := conn.Handshake(); err != nil {
-			c.Errorf("TLS route handshake error: %v", err)
-			c.sendErr("Secure Connection - TLS Required")
-			c.closeConnection(TLSHandshakeError)
-			return nil
-		}
-		// Reset the read deadline
-		conn.SetReadDeadline(time.Time{})
-
-		// Re-Grab lock
-		c.mu.Lock()
-
-		// To be consistent with client, set this flag to indicate that handshake is done
-		c.flags.set(handshakeComplete)
-
-		// Verify that the connection did not go away while we released the lock.
-		if c.isClosed() {
-			c.mu.Unlock()
-			return nil
-		}
 	}
 
 	// Do final client initialization
@@ -1367,9 +1271,6 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 		// No lock needed since we are already under client lock.
 		c.setRoutePermissions(opts.Cluster.Permissions)
 	}
-
-	// Set the Ping timer
-	s.setFirstPingTimer(c)
 
 	// For routes, the "client" is added to s.routes only when processing
 	// the INFO protocol, that is much later.
@@ -1386,10 +1287,12 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 
 	// Check for Auth required state for incoming connections.
 	// Make sure to do this before spinning up readLoop.
-	if authRequired && !didSolicit {
-		ttl := secondsToDuration(opts.Cluster.AuthTimeout)
-		c.setAuthTimer(ttl)
-	}
+	/*
+		if authRequired && !didSolicit {
+			ttl := secondsToDuration(opts.Cluster.AuthTimeout)
+			c.setAuthTimer(ttl)
+		}
+	*/
 
 	// Spin up the read loop.
 	s.startGoRoutine(func() { c.readLoop(nil) })
@@ -1397,16 +1300,10 @@ func (s *Server) createRoute(conn net.Conn, rURL *url.URL) *client {
 	// Spin up the write loop.
 	s.startGoRoutine(func() { c.writeLoop() })
 
-	if tlsRequired {
-		c.Debugf("TLS handshake complete")
-		cs := c.nc.(*tls.Conn).ConnectionState()
-		c.Debugf("TLS version %s, cipher suite %s", tlsVersion(cs.Version), tlsCipher(cs.CipherSuite))
-	}
-
 	// Queue Connect proto if we solicited the connection.
 	if didSolicit {
 		c.Debugf("Route connect msg sent")
-		if err := c.sendRouteConnect(clusterName, tlsRequired); err != nil {
+		if err := c.sendRouteConnect(clusterName); err != nil {
 			c.mu.Unlock()
 			c.closeConnection(ProtocolViolation)
 			return nil
@@ -1441,8 +1338,6 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		s.routes[c.cid] = c
 		s.remotes[id] = c
 		c.mu.Lock()
-		c.route.connectURLs = info.ClientConnectURLs
-		c.route.wsConnURLs = info.WSConnectURLs
 		cid := c.cid
 		hash := string(c.route.hash)
 		c.mu.Unlock()
@@ -1455,18 +1350,6 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 
 		// we don't need to send if the only route is the one we just accepted.
 		sendInfo = len(s.routes) > 1
-
-		// If the INFO contains a Gateway URL, add it to the list for our cluster.
-		if info.GatewayURL != "" && s.addGatewayURL(info.GatewayURL) {
-			s.sendAsyncGatewayInfo()
-		}
-
-		// Add the remote's leafnodeURL to our list of URLs and send the update
-		// to all LN connections. (Note that when coming from a route, LeafNodeURLs
-		// is an array of size 1 max).
-		if len(info.LeafNodeURLs) == 1 && s.addLeafNodeURL(info.LeafNodeURLs[0]) {
-			s.sendAsyncLeafNodeInfo()
-		}
 	}
 	s.mu.Unlock()
 
@@ -1484,7 +1367,7 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		// c.route.leafnodeURL, otherwise, when processing the disconnect, this
 		// would cause the leafnode URL for that remote server to be removed
 		// from our list.
-		c.route.leafnodeURL = _EMPTY_
+		// c.route.leafnodeURL = _EMPTY_
 		// Same for the route hash otherwise it would be removed from s.routesByHash.
 		c.route.hash = _EMPTY_
 		c.mu.Unlock()
@@ -1492,10 +1375,6 @@ func (s *Server) addRoute(c *client, info *Info) (bool, bool) {
 		remote.mu.Lock()
 		// r will be not nil if c.route.didSolicit was true
 		if r != nil {
-			// If we upgrade to solicited, we still want to keep the remote's
-			// connectURLs. So transfer those.
-			r.connectURLs = remote.route.connectURLs
-			r.wsConnURLs = remote.route.wsConnURLs
 			remote.route = r
 		}
 		// This is to mitigate the issue where both sides add the route
@@ -1655,11 +1534,6 @@ func (s *Server) startRouteAcceptLoop() {
 	opts := s.getOpts()
 
 	// Snapshot server options.
-	port := opts.Cluster.Port
-
-	if port == -1 {
-		port = 0
-	}
 
 	// This requires lock, so do this outside of may block.
 	clusterName := s.ClusterName()
@@ -1674,15 +1548,7 @@ func (s *Server) startRouteAcceptLoop() {
 		s.Warnf("Cluster name was dynamically generated, consider setting one")
 	}
 
-	hp := net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(port))
-	l, e := natsListen("tcp", hp)
-	if e != nil {
-		s.mu.Unlock()
-		s.Fatalf("Error listening on router port: %d - %v", opts.Cluster.Port, e)
-		return
-	}
-	s.Noticef("Listening for route connections on %s",
-		net.JoinHostPort(opts.Cluster.Host, strconv.Itoa(l.Addr().(*net.TCPAddr).Port)))
+	s.Noticef("Listening for route connections on internal mux")
 
 	proto := RouteProtoV2
 	// For tests, we want to be able to make this server behave
@@ -1695,93 +1561,34 @@ func (s *Server) startRouteAcceptLoop() {
 		// Here we compute back the real value.
 		proto = (opts.routeProto * -1) - 1
 	}
-	// Check for TLSConfig
-	tlsReq := opts.Cluster.TLSConfig != nil
 	info := Info{
-		ID:           s.info.ID,
-		Name:         s.info.Name,
-		Version:      s.info.Version,
-		GoVersion:    runtime.Version(),
-		AuthRequired: false,
-		TLSRequired:  tlsReq,
-		TLSVerify:    tlsReq,
-		MaxPayload:   s.info.MaxPayload,
-		Proto:        proto,
-		GatewayURL:   s.getGatewayURL(),
-		Headers:      s.supportsHeaders(),
-		Cluster:      s.info.Cluster,
-		Dynamic:      s.isClusterNameDynamic(),
-		LNOC:         true,
-	}
-	// Set this if only if advertise is not disabled
-	if !opts.Cluster.NoAdvertise {
-		info.ClientConnectURLs = s.clientConnectURLs
-		info.WSConnectURLs = s.websocket.connectURLs
-	}
-	// If we have selected a random port...
-	if port == 0 {
-		// Write resolved port back to options.
-		opts.Cluster.Port = l.Addr().(*net.TCPAddr).Port
-	}
-	// Check for Auth items
-	if opts.Cluster.Username != "" {
-		info.AuthRequired = true
+		ID:         s.info.ID,
+		Name:       s.info.Name,
+		Version:    s.info.Version,
+		GoVersion:  runtime.Version(),
+		MaxPayload: s.info.MaxPayload,
+		Proto:      proto,
+		Headers:    s.supportsHeaders(),
+		Cluster:    s.info.Cluster,
+		Dynamic:    s.isClusterNameDynamic(),
+		LNOC:       true,
 	}
 	// Check for permissions.
 	if opts.Cluster.Permissions != nil {
 		info.Import = opts.Cluster.Permissions.Import
 		info.Export = opts.Cluster.Permissions.Export
 	}
-	// If this server has a LeafNode accept loop, s.leafNodeInfo.IP is,
-	// at this point, set to the host:port for the leafnode accept URL,
-	// taking into account possible advertise setting. Use the LeafNodeURLs
-	// and set this server's leafnode accept URL. This will be sent to
-	// routed servers.
-	if !opts.LeafNode.NoAdvertise && s.leafNodeInfo.IP != _EMPTY_ {
-		info.LeafNodeURLs = []string{s.leafNodeInfo.IP}
-	}
 	s.routeInfo = info
-	// Possibly override Host/Port and set IP based on Cluster.Advertise
-	if err := s.setRouteInfoHostPortAndIP(); err != nil {
-		s.Fatalf("Error setting route INFO with Cluster.Advertise value of %s, err=%v", s.opts.Cluster.Advertise, err)
-		l.Close()
-		s.mu.Unlock()
-		return
-	}
-	// Setup state that can enable shutdown
-	s.routeListener = l
-	// Warn if using Cluster.Insecure
-	if tlsReq && opts.Cluster.TLSConfig.InsecureSkipVerify {
-		s.Warnf(clusterTLSInsecureWarning)
-	}
 
 	// Start the accept loop in a different go routine.
-	go s.acceptConnections(l, "Route", func(conn net.Conn) { s.createRoute(conn, nil) }, nil)
-
-	// Solicit Routes if applicable. This will not block.
-	s.solicitRoutes(opts.Routes)
+	// go s.acceptConnections(l, "Route", func(conn net.Conn) { s.createRoute(conn, nil) }, nil)
 
 	s.mu.Unlock()
 }
 
-// Similar to setInfoHostPortAndGenerateJSON, but for routeInfo.
-func (s *Server) setRouteInfoHostPortAndIP() error {
-	if s.opts.Cluster.Advertise != "" {
-		advHost, advPort, err := parseHostPort(s.opts.Cluster.Advertise, s.opts.Cluster.Port)
-		if err != nil {
-			return err
-		}
-		s.routeInfo.Host = advHost
-		s.routeInfo.Port = advPort
-		s.routeInfo.IP = fmt.Sprintf("nats-route://%s/", net.JoinHostPort(advHost, strconv.Itoa(advPort)))
-	} else {
-		s.routeInfo.Host = s.opts.Cluster.Host
-		s.routeInfo.Port = s.opts.Cluster.Port
-		s.routeInfo.IP = ""
-	}
-	// (re)generate the routeInfoJSON byte array
-	s.generateRouteInfoJSON()
-	return nil
+// HandleRouterConnection handles an incoming route session.
+func (s *Server) HandleRouterConnection(conn net.Conn, remoteID string) {
+	s.createRoute(conn, remoteID)
 }
 
 // StartRouting will start the accept loop on the cluster host:port
@@ -1798,97 +1605,10 @@ func (s *Server) StartRouting(clientListenReady chan struct{}) {
 
 }
 
-func (s *Server) reConnectToRoute(rURL *url.URL, rtype RouteType) {
-	tryForEver := rtype == Explicit
-	// If A connects to B, and B to A (regardless if explicit or
-	// implicit - due to auto-discovery), and if each server first
-	// registers the route on the opposite TCP connection, the
-	// two connections will end-up being closed.
-	// Add some random delay to reduce risk of repeated failures.
-	delay := time.Duration(rand.Intn(100)) * time.Millisecond
-	if tryForEver {
-		delay += DEFAULT_ROUTE_RECONNECT
-	}
-	select {
-	case <-time.After(delay):
-	case <-s.quitCh:
-		s.grWG.Done()
-		return
-	}
-	s.connectToRoute(rURL, tryForEver, false)
-}
-
-// Checks to make sure the route is still valid.
-func (s *Server) routeStillValid(rURL *url.URL) bool {
-	for _, ri := range s.getOpts().Routes {
-		if urlsAreEqual(ri, rURL) {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) connectToRoute(rURL *url.URL, tryForEver, firstConnect bool) {
-	// Snapshot server options.
-	opts := s.getOpts()
-
-	defer s.grWG.Done()
-
-	const connErrFmt = "Error trying to connect to route (attempt %v): %v"
-
-	attempts := 0
-	for s.isRunning() && rURL != nil {
-		if tryForEver && !s.routeStillValid(rURL) {
-			return
-		}
-		s.Debugf("Trying to connect to route on %s", rURL.Host)
-		conn, err := natsDialTimeout("tcp", rURL.Host, DEFAULT_ROUTE_DIAL)
-		if err != nil {
-			attempts++
-			if s.shouldReportConnectErr(firstConnect, attempts) {
-				s.Errorf(connErrFmt, attempts, err)
-			} else {
-				s.Debugf(connErrFmt, attempts, err)
-			}
-			if !tryForEver {
-				if opts.Cluster.ConnectRetries <= 0 {
-					return
-				}
-				if attempts > opts.Cluster.ConnectRetries {
-					return
-				}
-			}
-			select {
-			case <-s.quitCh:
-				return
-			case <-time.After(routeConnectDelay):
-				continue
-			}
-		}
-
-		if tryForEver && !s.routeStillValid(rURL) {
-			conn.Close()
-			return
-		}
-
-		// We have a route connection here.
-		// Go ahead and create it and exit this func.
-		s.createRoute(conn, rURL)
-		return
-	}
-}
-
 func (c *client) isSolicitedRoute() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.kind == ROUTER && c.route != nil && c.route.didSolicit
-}
-
-func (s *Server) solicitRoutes(routes []*url.URL) {
-	for _, r := range routes {
-		route := r
-		s.startGoRoutine(func() { s.connectToRoute(route, true, true) })
-	}
 }
 
 func (c *client) processRouteConnect(srv *Server, arg []byte, lang string) error {
@@ -1975,17 +1695,13 @@ func (s *Server) removeAllRoutesExcept(c *client) {
 
 func (s *Server) removeRoute(c *client) {
 	var rID string
-	var lnURL string
-	var gwURL string
 	var hash string
 	c.mu.Lock()
 	cid := c.cid
 	r := c.route
 	if r != nil {
 		rID = r.remoteID
-		lnURL = r.leafnodeURL
 		hash = r.hash
-		gwURL = r.gatewayURL
 	}
 	c.mu.Unlock()
 	s.mu.Lock()
@@ -1998,14 +1714,16 @@ func (s *Server) removeRoute(c *client) {
 		}
 		// Remove the remote's gateway URL from our list and
 		// send update to inbound Gateway connections.
-		if gwURL != _EMPTY_ && s.removeGatewayURL(gwURL) {
-			s.sendAsyncGatewayInfo()
-		}
+		// if gwURL != _EMPTY_ && s.removeGatewayURL(gwURL) {
+		// 		s.sendAsyncGatewayInfo()
+		// }
 		// Remove the remote's leafNode URL from
 		// our list and send update to LN connections.
-		if lnURL != _EMPTY_ && s.removeLeafNodeURL(lnURL) {
-			s.sendAsyncLeafNodeInfo()
-		}
+		/*
+			if lnURL != _EMPTY_ && s.removeLeafNodeURL(lnURL) {
+				s.sendAsyncLeafNodeInfo()
+			}
+		*/
 		s.routesByHash.Delete(hash)
 	}
 	s.removeFromTempClients(cid)

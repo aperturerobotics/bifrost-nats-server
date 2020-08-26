@@ -17,7 +17,6 @@ package server
 type closedClient struct {
 	ConnInfo
 	subs []SubDetail
-	user string
 	acc  string
 }
 

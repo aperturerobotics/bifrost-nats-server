@@ -34,8 +34,6 @@ const (
 var (
 	// gitCommit injected at build
 	gitCommit string
-	// trustedKeys is a whitespace separated array of trusted operator's public nkeys.
-	trustedKeys string
 )
 
 const (
@@ -78,9 +76,6 @@ const (
 
 	// AUTH_TIMEOUT is the authorization wait time.
 	AUTH_TIMEOUT = 2 * TLS_TIMEOUT
-
-	// DEFAULT_PING_INTERVAL is how often pings are sent to clients and routes.
-	DEFAULT_PING_INTERVAL = 2 * time.Minute
 
 	// DEFAULT_PING_MAX_OUT is maximum allowed pings outstanding before disconnect.
 	DEFAULT_PING_MAX_OUT = 2

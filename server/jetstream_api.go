@@ -1725,8 +1725,6 @@ func (c *client) auditUser() string {
 	switch {
 	case c.opts.Nkey != "":
 		return c.opts.Nkey
-	case c.opts.Username != "":
-		return c.opts.Username
 	default:
 		return ""
 	}

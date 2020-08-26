@@ -14,15 +14,12 @@
 package server
 
 import (
-	"fmt"
 	"io/ioutil"
-	"net"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/nats-io/jwt/v2"
-	"github.com/nats-io/nkeys"
 )
 
 var nscDecoratedRe = regexp.MustCompile(`\s*(?:(?:[-]{3,}[^\n]*[-]{3,}\n)(.+)(?:\n\s*[-]{3,}[^\n]*[-]{3,}[\n]*))`)
@@ -67,102 +64,6 @@ func wipeSlice(buf []byte) {
 	for i := range buf {
 		buf[i] = 'x'
 	}
-}
-
-// validateTrustedOperators will check that we do not have conflicts with
-// assigned trusted keys and trusted operators. If operators are defined we
-// will expand the trusted keys in options.
-func validateTrustedOperators(o *Options) error {
-	if len(o.TrustedOperators) == 0 {
-		return nil
-	}
-	if o.AllowNewAccounts {
-		return fmt.Errorf("operators do not allow dynamic creation of new accounts")
-	}
-	if o.AccountResolver == nil {
-		return fmt.Errorf("operators require an account resolver to be configured")
-	}
-	if len(o.Accounts) > 0 {
-		return fmt.Errorf("operators do not allow Accounts to be configured directly")
-	}
-	if len(o.Users) > 0 || len(o.Nkeys) > 0 {
-		return fmt.Errorf("operators do not allow users to be configured directly")
-	}
-	if len(o.TrustedOperators) > 0 && len(o.TrustedKeys) > 0 {
-		return fmt.Errorf("conflicting options for 'TrustedKeys' and 'TrustedOperators'")
-	}
-	if o.SystemAccount != "" {
-		foundSys := false
-		foundNonEmpty := false
-		for _, op := range o.TrustedOperators {
-			if op.SystemAccount != "" {
-				foundNonEmpty = true
-			}
-			if op.SystemAccount == o.SystemAccount {
-				foundSys = true
-				break
-			}
-		}
-		if foundNonEmpty && !foundSys {
-			return fmt.Errorf("system_account in config and operator JWT must be identical")
-		}
-	}
-	srvMajor, srvMinor, srvUpdate, _ := jwt.ParseServerVersion(strings.Split(VERSION, "-")[0])
-	for _, opc := range o.TrustedOperators {
-		if major, minor, update, err := jwt.ParseServerVersion(opc.AssertServerVersion); err != nil {
-			return fmt.Errorf("operator %s expects version %s got error instead: %s",
-				opc.Subject, opc.AssertServerVersion, err)
-		} else if major > srvMajor {
-			return fmt.Errorf("operator %s expected major version %d > server major version %d",
-				opc.Subject, major, srvMajor)
-		} else if srvMajor > major {
-		} else if minor > srvMinor {
-			return fmt.Errorf("operator %s expected minor version %d > server minor version %d",
-				opc.Subject, minor, srvMinor)
-		} else if srvMinor > minor {
-		} else if update > srvUpdate {
-			return fmt.Errorf("operator %s expected update version %d > server update version %d",
-				opc.Subject, update, srvUpdate)
-		}
-	}
-	// If we have operators, fill in the trusted keys.
-	// FIXME(dlc) - We had TrustedKeys before TrustedOperators. The jwt.OperatorClaims
-	// has a DidSign(). Use that longer term. For now we can expand in place.
-	for _, opc := range o.TrustedOperators {
-		if o.TrustedKeys == nil {
-			o.TrustedKeys = make([]string, 0, 4)
-		}
-		o.TrustedKeys = append(o.TrustedKeys, opc.Issuer)
-		o.TrustedKeys = append(o.TrustedKeys, opc.SigningKeys...)
-	}
-	for _, key := range o.TrustedKeys {
-		if !nkeys.IsValidPublicOperatorKey(key) {
-			return fmt.Errorf("trusted Keys %q are required to be a valid public operator nkey", key)
-		}
-	}
-	return nil
-}
-
-func validateSrc(claims *jwt.UserClaims, host string) bool {
-	if claims == nil {
-		return false
-	} else if claims.Src == "" {
-		return true
-	} else if host == "" {
-		return false
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return false
-	}
-	for _, cidr := range strings.Split(claims.Src, ",") {
-		if _, net, err := net.ParseCIDR(cidr); err != nil {
-			return false // should not happen as this jwt is invalid
-		} else if net.Contains(ip) {
-			return true
-		}
-	}
-	return false
 }
 
 func validateTimes(claims *jwt.UserClaims) (bool, time.Duration) {

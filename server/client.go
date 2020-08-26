@@ -15,7 +15,6 @@ package server
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -149,7 +148,6 @@ type ClosedState int
 
 const (
 	ClientClosed = ClosedState(iota + 1)
-	AuthenticationTimeout
 	AuthenticationViolation
 	TLSHandshakeError
 	SlowConsumerPendingBytes
@@ -169,7 +167,6 @@ const (
 	DuplicateRoute
 	RouteRemoved
 	ServerShutdown
-	AuthenticationExpired
 	WrongGateway
 	MissingAccount
 	Revocation
@@ -215,15 +212,11 @@ type client struct {
 	ncs        string
 	out        outbound
 	user       *NkeyUser
-	host       string
-	port       uint16
 	subs       map[string]*subscription
 	replies    map[string]*resp
 	mperms     *msgDeny
 	darray     []string
 	pcd        map[*client]struct{}
-	atmr       *time.Timer
-	ping       pinfo
 	msgb       [msgScratchSize]byte
 	last       time.Time
 	headers    bool
@@ -234,7 +227,6 @@ type client struct {
 	route *route
 	gw    *gateway
 	leaf  *leaf
-	ws    *websocket
 
 	// To keep track of gateway replies mapping
 	gwrm map[string]*gwReplyMap
@@ -251,13 +243,6 @@ type rrTracking struct {
 	rmap map[string]*remoteLatency
 	ptmr *time.Timer
 	lrt  time.Duration
-}
-
-// Struct for PING initiation from the server.
-type pinfo struct {
-	tmr  *time.Timer
-	last time.Time
-	out  int
 }
 
 // outbound holds pending data for a socket.
@@ -382,17 +367,6 @@ func (c *client) GetOpts() *clientOpts {
 	return &c.opts
 }
 
-// GetTLSConnectionState returns the TLS ConnectionState if TLS is enabled, nil
-// otherwise. Implements the ClientAuth interface.
-func (c *client) GetTLSConnectionState() *tls.ConnectionState {
-	tc, ok := c.nc.(*tls.Conn)
-	if !ok {
-		return nil
-	}
-	state := tc.ConnectionState()
-	return &state
-}
-
 // This is the main subscription struct that indicates
 // interest in published messages.
 // FIXME(dlc) - This is getting bloated for normal subs, need
@@ -428,13 +402,8 @@ type clientOpts struct {
 	Echo         bool   `json:"echo"`
 	Verbose      bool   `json:"verbose"`
 	Pedantic     bool   `json:"pedantic"`
-	TLSRequired  bool   `json:"tls_required"`
 	Nkey         string `json:"nkey,omitempty"`
-	JWT          string `json:"jwt,omitempty"`
 	Sig          string `json:"sig,omitempty"`
-	Token        string `json:"auth_token,omitempty"`
-	Username     string `json:"user,omitempty"`
-	Password     string `json:"pass,omitempty"`
 	Name         string `json:"name"`
 	Lang         string `json:"lang"`
 	Version      string `json:"version"`
@@ -489,33 +458,16 @@ func (c *client) initClient() {
 	c.pcd = make(map[*client]struct{})
 
 	// snapshot the string version of the connection
-	var conn string
-	if c.nc != nil {
-		if addr := c.nc.RemoteAddr(); addr != nil {
-			if conn = addr.String(); conn != _EMPTY_ {
-				host, port, _ := net.SplitHostPort(conn)
-				iPort, _ := strconv.Atoi(port)
-				c.host, c.port = host, uint16(iPort)
-				// Now that we have extracted host and port, escape
-				// the string because it is going to be used in Sprintf
-				conn = strings.ReplaceAll(conn, "%", "%%")
-			}
-		}
-	}
-
 	switch c.kind {
 	case CLIENT:
 		name := "cid"
-		if c.ws != nil {
-			name = "wid"
-		}
-		c.ncs = fmt.Sprintf("%s - %s:%d", conn, name, c.cid)
+		c.ncs = fmt.Sprintf("%s:%d", name, c.cid)
 	case ROUTER:
-		c.ncs = fmt.Sprintf("%s - rid:%d", conn, c.cid)
+		c.ncs = fmt.Sprintf("rid:%d", c.cid)
 	case GATEWAY:
-		c.ncs = fmt.Sprintf("%s - gid:%d", conn, c.cid)
+		c.ncs = fmt.Sprintf("gid:%d", c.cid)
 	case LEAF:
-		c.ncs = fmt.Sprintf("%s - lid:%d", conn, c.cid)
+		c.ncs = fmt.Sprintf("lid:%d", c.cid)
 	case SYSTEM:
 		c.ncs = "SYSTEM"
 	case JETSTREAM:
@@ -628,31 +580,6 @@ func (c *client) applyAccountLimits() {
 	}
 }
 
-// RegisterUser allows auth to call back into a new client
-// with the authenticated user. This is used to map
-// any permissions into the client and setup accounts.
-func (c *client) RegisterUser(user *User) {
-	// Register with proper account and sublist.
-	if user.Account != nil {
-		if err := c.registerWithAccount(user.Account); err != nil {
-			c.reportErrRegisterAccount(user.Account, err)
-			return
-		}
-	}
-
-	c.mu.Lock()
-
-	// Assign permissions.
-	if user.Permissions == nil {
-		// Reset perms to nil in case client previously had them.
-		c.perms = nil
-		c.mperms = nil
-	} else {
-		c.setPermissions(user.Permissions)
-	}
-	c.mu.Unlock()
-}
-
 // RegisterNkey allows auth to call back into a new nkey
 // client with the authenticated user. This is used to map
 // any permissions into the client and setup accounts.
@@ -763,27 +690,6 @@ func (c *client) setPermissions(perms *Permissions) {
 	if c.isHubLeafNode() {
 		c.opts.Import = perms.Subscribe
 		c.opts.Export = perms.Publish
-	}
-}
-
-// Check to see if we have an expiration for the user JWT via base claims.
-// FIXME(dlc) - Clear on connect with new JWT.
-func (c *client) setExpiration(claims *jwt.ClaimsData, validFor time.Duration) {
-	if claims.Expires == 0 {
-		if validFor != 0 {
-			c.setExpirationTimer(validFor)
-		}
-		return
-	}
-	expiresAt := time.Duration(0)
-	tn := time.Now().Unix()
-	if claims.Expires > tn {
-		expiresAt = time.Duration(claims.Expires-tn) * time.Second
-	}
-	if validFor != 0 && validFor < expiresAt {
-		c.setExpirationTimer(validFor)
-	} else {
-		c.setExpirationTimer(expiresAt)
 	}
 }
 
@@ -911,7 +817,6 @@ func (c *client) readLoop(pre []byte) {
 		return
 	}
 	nc := c.nc
-	ws := c.ws != nil
 	c.in.rsz = startBufSize
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
@@ -944,12 +849,6 @@ func (c *client) readLoop(pre []byte) {
 	var _bufs [1][]byte
 	bufs := _bufs[:1]
 
-	var wsr *wsReadInfo
-	if ws {
-		wsr = &wsReadInfo{}
-		wsr.init()
-	}
-
 	// If we have a pre parse that first.
 	if len(pre) > 0 {
 		c.parse(pre)
@@ -962,19 +861,7 @@ func (c *client) readLoop(pre []byte) {
 			c.closeConnection(closedStateForErr(err))
 			return
 		}
-		if ws {
-			bufs, err = c.wsRead(wsr, nc, b[:n])
-			if bufs == nil && err != nil {
-				if err != io.EOF {
-					c.Errorf("read error: %v", err)
-				}
-				c.closeConnection(closedStateForErr(err))
-			} else if bufs == nil {
-				continue
-			}
-		} else {
-			bufs[0] = b[:n]
-		}
+		bufs[0] = b[:n]
 		start := time.Now()
 
 		// Clear inbound stats cache
@@ -1078,9 +965,6 @@ func closedStateForErr(err error) ClosedState {
 // collapsePtoNB will place primary onto nb buffer as needed in prep for WriteTo.
 // This will return a copy on purpose.
 func (c *client) collapsePtoNB() (net.Buffers, int64) {
-	if c.ws != nil {
-		return c.wsCollapsePtoNB()
-	}
 	if c.out.p != nil {
 		p := c.out.p
 		c.out.p = nil
@@ -1092,10 +976,6 @@ func (c *client) collapsePtoNB() (net.Buffers, int64) {
 // This will handle the fixup needed on a partial write.
 // Assume pending has been already calculated correctly.
 func (c *client) handlePartialWrite(pnb net.Buffers) {
-	if c.ws != nil {
-		c.ws.frames = append(pnb, c.ws.frames...)
-		return
-	}
 	nb, _ := c.collapsePtoNB()
 	// The partial needs to be first, so append nb to pnb
 	c.out.nb = append(pnb, nb...)
@@ -1186,9 +1066,6 @@ func (c *client) flushOutbound() bool {
 
 	// Subtract from pending bytes and messages.
 	c.out.pb -= n
-	if c.ws != nil {
-		c.ws.fs -= n
-	}
 	c.out.pm -= apm // FIXME(dlc) - this will not be totally accurate on partials.
 
 	// Check for partial writes
@@ -1248,16 +1125,7 @@ func (c *client) flushOutbound() bool {
 // Returns a boolean to indicate if the connection has been closed or not.
 // Lock is held on entry.
 func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) bool {
-	if tlsConn, ok := c.nc.(*tls.Conn); ok {
-		if !tlsConn.ConnectionState().HandshakeComplete {
-			// Likely a TLSTimeout error instead...
-			c.markConnAsClosed(TLSHandshakeError)
-			// Would need to coordinate with tlstimeout()
-			// to avoid double logging, so skip logging
-			// here, and don't report a slow consumer error.
-			return true
-		}
-	} else if c.flags.isSet(expectConnect) && !c.flags.isSet(connectReceived) {
+	if c.flags.isSet(expectConnect) && !c.flags.isSet(connectReceived) {
 		// Under some conditions, a connection may hit a slow consumer write deadline
 		// before the authorization timeout. If that is the case, then we handle
 		// as slow consumer though we do not increase the counter as that can be
@@ -1302,12 +1170,15 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 	if c.flags.isSet(connMarkedClosed) {
 		return
 	}
+	_ = skipFlush
 	c.flags.set(connMarkedClosed)
 	// For a websocket client, unless we are told not to flush, enqueue
 	// a websocket CloseMessage based on the reason.
-	if !skipFlush && c.ws != nil && !c.ws.closeSent {
-		c.wsEnqueueCloseMessage(reason)
-	}
+	/*
+		if !skipFlush && c.ws != nil && !c.ws.closeSent {
+			c.wsEnqueueCloseMessage(reason)
+		}
+	*/
 	// Be consistent with the creation: for routes and gateways,
 	// we use Noticef on create, so use that too for delete.
 	if c.srv != nil {
@@ -1473,26 +1344,10 @@ func computeRTT(start time.Time) time.Duration {
 func (c *client) processConnect(arg []byte) error {
 	supportsHeaders := c.srv.supportsHeaders()
 	c.mu.Lock()
-	// If we can't stop the timer because the callback is in progress...
-	if !c.clearAuthTimer() {
-		// wait for it to finish and handle sending the failure back to
-		// the client.
-		for !c.isClosed() {
-			c.mu.Unlock()
-			time.Sleep(25 * time.Millisecond)
-			c.mu.Lock()
-		}
-		c.mu.Unlock()
-		return nil
-	}
 	c.last = time.Now()
 	// Estimate RTT to start.
 	if c.kind == CLIENT {
 		c.rtt = computeRTT(c.start)
-		if c.srv != nil {
-			c.clearPingTimer()
-			c.srv.setFirstPingTimer(c)
-		}
 	}
 	kind := c.kind
 	srv := c.srv
@@ -1517,12 +1372,6 @@ func (c *client) processConnect(arg []byte) error {
 	account := c.opts.Account
 	accountNew := c.opts.AccountNew
 
-	// If websocket client and JWT not in the CONNECT, use the cookie JWT (possibly empty).
-	if ws := c.ws; ws != nil && c.opts.JWT == "" {
-		c.opts.JWT = ws.cookieJwt
-	}
-	ujwt := c.opts.JWT
-
 	// For headers both client and server need to support.
 	c.headers = supportsHeaders && c.opts.Headers
 	c.mu.Unlock()
@@ -1541,18 +1390,6 @@ func (c *client) processConnect(arg []byte) error {
 
 		// Check for Auth
 		if ok := srv.checkAuthentication(c); !ok {
-			// We may fail here because we reached max limits on an account.
-			if ujwt != "" {
-				c.mu.Lock()
-				acc := c.acc
-				c.mu.Unlock()
-				srv.mu.Lock()
-				tooManyAccCons := acc != nil && acc != srv.gacc
-				srv.mu.Unlock()
-				if tooManyAccCons {
-					return ErrTooManyAccountConnections
-				}
-			}
 			c.authViolation()
 			return ErrAuthentication
 		}
@@ -1637,43 +1474,20 @@ func (c *client) sendErrAndDebug(err string) {
 	c.Debugf(err)
 }
 
-func (c *client) authTimeout() {
-	c.sendErrAndDebug("Authentication Timeout")
-	c.closeConnection(AuthenticationTimeout)
-}
-
-func (c *client) authExpired() {
-	c.sendErrAndDebug("User Authentication Expired")
-	c.closeConnection(AuthenticationExpired)
-}
-
-func (c *client) accountAuthExpired() {
-	c.sendErrAndDebug("Account Authentication Expired")
-	c.closeConnection(AuthenticationExpired)
-}
-
 func (c *client) authViolation() {
 	var s *Server
-	var hasTrustedNkeys, hasNkeys, hasUsers bool
+	var hasNkeys bool
 	if s = c.srv; s != nil {
 		s.mu.Lock()
-		hasTrustedNkeys = len(s.trustedKeys) > 0
-		hasNkeys = s.nkeys != nil
-		hasUsers = s.users != nil
+		hasNkeys = len(s.nkeys) != 0
 		s.mu.Unlock()
 		defer s.sendAuthErrorEvent(c)
 
 	}
-	if hasTrustedNkeys {
-		c.Errorf("%v", ErrAuthentication)
-	} else if hasNkeys {
+	if hasNkeys {
 		c.Errorf("%s - Nkey %q",
 			ErrAuthentication.Error(),
 			c.opts.Nkey)
-	} else if hasUsers {
-		c.Errorf("%s - User %q",
-			ErrAuthentication.Error(),
-			c.opts.Username)
 	} else {
 		c.Errorf(ErrAuthentication.Error())
 	}
@@ -1855,7 +1669,6 @@ func (c *client) sendRTTPingLocked() bool {
 // Assume the lock is held upon entry.
 func (c *client) sendPing() {
 	c.rttStart = time.Now()
-	c.ping.out++
 	if c.trace {
 		c.traceOutOp("PING", nil)
 	}
@@ -1867,12 +1680,7 @@ func (c *client) sendPing() {
 // Assume lock is held.
 func (c *client) generateClientInfoJSON(info Info) []byte {
 	info.CID = c.cid
-	info.ClientIP = c.host
 	info.MaxPayload = c.mpay
-	if c.ws != nil {
-		info.ClientConnectURLs = info.WSConnectURLs
-	}
-	info.WSConnectURLs = nil
 	// Generate the info json
 	b, _ := json.Marshal(info)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
@@ -1899,66 +1707,26 @@ func (c *client) sendOK() {
 
 func (c *client) processPing() {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if c.isClosed() {
-		c.mu.Unlock()
 		return
 	}
 
 	c.sendPong()
 
-	// Record this to suppress us sending one if this
-	// is within a given time interval for activity.
-	c.ping.last = time.Now()
-
 	// If not a CLIENT, we are done. Also the CONNECT should
 	// have been received, but make sure it is so before proceeding
 	if c.kind != CLIENT || !c.flags.isSet(connectReceived) {
-		c.mu.Unlock()
 		return
 	}
 
-	// If we are here, the CONNECT has been received so we know
-	// if this client supports async INFO or not.
-	var (
-		checkInfoChange bool
-		srv             = c.srv
-	)
-	// For older clients, just flip the firstPongSent flag if not already
-	// set and we are done.
-	if c.opts.Protocol < ClientProtoInfo || srv == nil {
-		c.flags.setIfNotSet(firstPongSent)
-	} else {
-		// This is a client that supports async INFO protocols.
-		// If this is the first PING (so firstPongSent is not set yet),
-		// we will need to check if there was a change in cluster topology
-		// or we have a different max payload. We will send this first before
-		// pong since most clients do flush after connect call.
-		checkInfoChange = !c.flags.isSet(firstPongSent)
-	}
-	c.mu.Unlock()
-
-	if checkInfoChange {
-		opts := srv.getOpts()
-		srv.mu.Lock()
-		c.mu.Lock()
-		// Now that we are under both locks, we can flip the flag.
-		// This prevents sendAsyncInfoToClients() and code here to
-		// send a double INFO protocol.
-		c.flags.set(firstPongSent)
-		// If there was a cluster update since this client was created,
-		// send an updated INFO protocol now.
-		if srv.lastCURLsUpdate >= c.start.UnixNano() || c.mpay != int32(opts.MaxPayload) {
-			c.enqueueProto(c.generateClientInfoJSON(srv.copyInfo()))
-		}
-		c.mu.Unlock()
-		srv.mu.Unlock()
-	}
+	// just flip the firstPongSent flag if not already set
+	c.flags.setIfNotSet(firstPongSent)
 }
 
 func (c *client) processPong() {
 	c.mu.Lock()
-	c.ping.out = 0
 	c.rtt = computeRTT(c.rttStart)
 	srv := c.srv
 	reorderGWs := c.kind == GATEWAY && c.gw.outbound
@@ -3793,92 +3561,11 @@ func (c *client) replySubjectViolation(reply []byte) {
 	c.Errorf("Publish Violation - %s, Reply %q", c.getAuthUser(), reply)
 }
 
-func (c *client) processPingTimer() {
-	c.mu.Lock()
-	c.ping.tmr = nil
-	// Check if connection is still opened
-	if c.isClosed() {
-		c.mu.Unlock()
-		return
-	}
-
-	c.Debugf("%s Ping Timer", c.typeString())
-
-	// If we have had activity within the PingInterval then
-	// there is no need to send a ping. This can be client data
-	// or if we received a ping from the other side.
-	pingInterval := c.srv.getOpts().PingInterval
-	now := time.Now()
-	needRTT := c.rtt == 0 || now.Sub(c.rttStart) > DEFAULT_RTT_MEASUREMENT_INTERVAL
-
-	if delta := now.Sub(c.last); delta < pingInterval && !needRTT {
-		c.Debugf("Delaying PING due to client activity %v ago", delta.Round(time.Second))
-	} else if delta := now.Sub(c.ping.last); delta < pingInterval && !needRTT {
-		c.Debugf("Delaying PING due to remote ping %v ago", delta.Round(time.Second))
-	} else {
-		// Check for violation
-		if c.ping.out+1 > c.srv.getOpts().MaxPingsOut {
-			c.Debugf("Stale Client Connection - Closing")
-			c.enqueueProto([]byte(fmt.Sprintf(errProto, "Stale Connection")))
-			c.mu.Unlock()
-			c.closeConnection(StaleConnection)
-			return
-		}
-		// Send PING
-		c.sendPing()
-	}
-
-	// Reset to fire again.
-	c.setPingTimer()
-	c.mu.Unlock()
-}
-
-// Lock should be held
-func (c *client) setPingTimer() {
-	if c.srv == nil {
-		return
-	}
-	d := c.srv.getOpts().PingInterval
-	c.ping.tmr = time.AfterFunc(d, c.processPingTimer)
-}
-
-// Lock should be held
-func (c *client) clearPingTimer() {
-	if c.ping.tmr == nil {
-		return
-	}
-	c.ping.tmr.Stop()
-	c.ping.tmr = nil
-}
-
-// Lock should be held
-func (c *client) setAuthTimer(d time.Duration) {
-	c.atmr = time.AfterFunc(d, c.authTimeout)
-}
-
-// Lock should be held
-func (c *client) clearAuthTimer() bool {
-	if c.atmr == nil {
-		return true
-	}
-	stopped := c.atmr.Stop()
-	c.atmr = nil
-	return stopped
-}
-
 // We may reuse atmr for expiring user jwts,
 // so check connectReceived.
 // Lock assume held on entry.
 func (c *client) awaitingAuth() bool {
-	return !c.flags.isSet(connectReceived) && c.atmr != nil
-}
-
-// This will set the atmr for the JWT expiration time.
-// We will lock on entry.
-func (c *client) setExpirationTimer(d time.Duration) {
-	c.mu.Lock()
-	c.atmr = time.AfterFunc(d, c.authExpired)
-	c.mu.Unlock()
+	return !c.flags.isSet(connectReceived) //  && c.atmr != nil
 }
 
 // Possibly flush the connection and then close the low level connection.
@@ -4021,8 +3708,6 @@ func (c *client) closeConnection(reason ClosedState) {
 	// so don't set this to 1, instead bump the count.
 	c.rref++
 	c.flags.set(closeConnection)
-	c.clearAuthTimer()
-	c.clearPingTimer()
 	c.markConnAsClosed(reason)
 
 	// Unblock anyone who is potentially stalled waiting on us.
@@ -4032,12 +3717,10 @@ func (c *client) closeConnection(reason ClosedState) {
 	}
 
 	var (
-		connectURLs   []string
-		wsConnectURLs []string
-		kind          = c.kind
-		srv           = c.srv
-		noReconnect   = c.flags.isSet(noReconnect)
-		acc           = c.acc
+		kind        = c.kind
+		srv         = c.srv
+		noReconnect = c.flags.isSet(noReconnect)
+		acc         = c.acc
 	)
 
 	// Snapshot for use if we are a client connection.
@@ -4053,11 +3736,6 @@ func (c *client) closeConnection(reason ClosedState) {
 			sub.close()
 			subs = append(subs, sub)
 		}
-	}
-
-	if c.route != nil {
-		connectURLs = c.route.connectURLs
-		wsConnectURLs = c.route.wsConnURLs
 	}
 
 	// If we have remote latency tracking running shut that down.
@@ -4076,13 +3754,6 @@ func (c *client) closeConnection(reason ClosedState) {
 	}
 
 	if srv != nil {
-		// If this is a route that disconnected, possibly send an INFO with
-		// the updated list of connect URLs to clients that know how to
-		// handle async INFOs.
-		if (len(connectURLs) > 0 || len(wsConnectURLs) > 0) && !srv.getOpts().Cluster.NoAdvertise {
-			srv.removeConnectURLsAndSendINFOToClients(connectURLs, wsConnectURLs)
-		}
-
 		// Unregister
 		srv.removeClient(c)
 
@@ -4166,8 +3837,7 @@ func (c *client) reconnect() {
 		// Capture these under lock
 		c.mu.Lock()
 		rid := c.route.remoteID
-		rtype := c.route.routeType
-		rurl := c.route.url
+		// rtype := c.route.routeType
 		c.mu.Unlock()
 
 		srv.mu.Lock()
@@ -4183,14 +3853,14 @@ func (c *client) reconnect() {
 			srv.Debugf("Not attempting reconnect for solicited route, already connected to \"%s\"", rid)
 			return
 		} else if rid == srv.info.ID {
-			srv.Debugf("Detected route to self, ignoring \"%s\"", rurl)
+			srv.Debugf("Detected route to self, ignoring")
 			return
-		} else if rtype != Implicit || retryImplicit {
-			srv.Debugf("Attempting reconnect for solicited route \"%s\"", rurl)
+		} /*else if rtype != Implicit || retryImplicit {
+			srv.Debugf("Attempting reconnect for solicited route")
 			// Keep track of this go-routine so we can wait for it on
 			// server shutdown.
-			srv.startGoRoutine(func() { srv.reConnectToRoute(rurl, rtype) })
-		}
+			srv.startGoRoutine(func() { srv.reConnectToRoute(rid, rtype) })
+		}*/
 	} else if srv != nil && kind == GATEWAY && gwIsOutbound {
 		if gwCfg != nil {
 			srv.Debugf("Attempting reconnect for gateway %q", gwName)
@@ -4327,7 +3997,6 @@ func (c *client) getClientInfo(detailed bool) LatencyClient {
 	// Detailed is opt in.
 	if detailed {
 		lc.Start = c.start.UTC()
-		lc.IP = c.host
 		lc.CID = c.cid
 		lc.Name = c.opts.Name
 		lc.User = c.getRawAuthUser()
@@ -4345,12 +4014,6 @@ func (c *client) getRawAuthUser() string {
 	switch {
 	case c.opts.Nkey != "":
 		return c.opts.Nkey
-	case c.opts.Username != "":
-		return c.opts.Username
-	case c.opts.JWT != "":
-		return c.pubKey
-	case c.opts.Token != "":
-		return c.opts.Token
 	default:
 		return ""
 	}
@@ -4362,10 +4025,6 @@ func (c *client) getAuthUser() string {
 	switch {
 	case c.opts.Nkey != "":
 		return fmt.Sprintf("Nkey %q", c.opts.Nkey)
-	case c.opts.Username != "":
-		return fmt.Sprintf("User %q", c.opts.Username)
-	case c.opts.JWT != "":
-		return fmt.Sprintf("JWT User %q", c.pubKey)
 	default:
 		return `User "N/A"`
 	}
