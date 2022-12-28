@@ -28,7 +28,6 @@ import (
 	"sync"
 
 	"github.com/minio/highwayhash"
-	"github.com/nats-io/nats-server/v2/server/sysmem"
 )
 
 // JetStreamConfig determines this server's configuration.
@@ -928,12 +927,7 @@ func (s *Server) dynJetStreamConfig(storeDir string) *JetStreamConfig {
 		jsc.StoreDir = filepath.Join(tdir, JetStreamStoreDir)
 	}
 	jsc.MaxStore = JetStreamMaxStoreDefault
-	// Estimate to 75% of total memory if we can determine system memory.
-	if sysMem := sysmem.Memory(); sysMem > 0 {
-		jsc.MaxMemory = sysMem / 4 * 3
-	} else {
-		jsc.MaxMemory = JetStreamMaxMemDefault
-	}
+	jsc.MaxMemory = JetStreamMaxMemDefault
 	return jsc
 }
 

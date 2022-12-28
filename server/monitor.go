@@ -25,18 +25,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"github.com/nats-io/nats-server/v2/server/pse"
 )
-
-// Snapshot this
-var numCores int
-var maxProcs int
-
-func init() {
-	numCores = runtime.NumCPU()
-	maxProcs = runtime.GOMAXPROCS(0)
-}
 
 // Connz represents detailed information on current client connections.
 type Connz struct {
@@ -967,10 +956,6 @@ type Varz struct {
 	Start             time.Time         `json:"start"`
 	Now               time.Time         `json:"now"`
 	Uptime            string            `json:"uptime"`
-	Mem               int64             `json:"mem"`
-	Cores             int               `json:"cores"`
-	MaxProcs          int               `json:"gomaxprocs"`
-	CPU               float64           `json:"cpu"`
 	Connections       int               `json:"connections"`
 	TotalConnections  uint64            `json:"total_connections"`
 	Routes            int               `json:"routes"`
@@ -1097,17 +1082,11 @@ func (s *Server) HandleRoot(w http.ResponseWriter, r *http.Request) {
 
 // Varz returns a Varz struct containing the server information.
 func (s *Server) Varz(varzOpts *VarzOptions) (*Varz, error) {
-	var rss, vss int64
-	var pcpu float64
-
-	// We want to do that outside of the lock.
-	pse.ProcUsage(&pcpu, &rss, &vss)
-
 	s.mu.Lock()
 	// We need to create a new instance of Varz (with no reference
 	// whatsoever to anything stored in the server) since the user
 	// has access to the returned value.
-	v := s.createVarz(pcpu, rss)
+	v := s.createVarz()
 	s.mu.Unlock()
 
 	return v, nil
@@ -1115,7 +1094,7 @@ func (s *Server) Varz(varzOpts *VarzOptions) (*Varz, error) {
 
 // Returns a Varz instance.
 // Server lock is held on entry.
-func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
+func (s *Server) createVarz() *Varz {
 	info := s.info
 	opts := s.getOpts()
 	gw := &opts.Gateway
@@ -1139,10 +1118,8 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 		LeafNode: LeafNodeOptsVarz{
 			Remotes: []RemoteLeafOptsVarz{},
 		},
-		Start:    s.start,
-		MaxSubs:  opts.MaxSubs,
-		Cores:    numCores,
-		MaxProcs: maxProcs,
+		Start:   s.start,
+		MaxSubs: opts.MaxSubs,
 	}
 	if len(opts.RoutePeers) > 0 {
 		varz.Cluster.RoutePeers = opts.RoutePeers
@@ -1180,7 +1157,7 @@ func (s *Server) createVarz(pcpu float64, rss int64) *Varz {
 	// Finish setting it up with fields that can be updated during
 	// configuration reload and runtime.
 	s.updateVarzConfigReloadableFields(varz)
-	s.updateVarzRuntimeFields(varz, true, pcpu, rss)
+	s.updateVarzRuntimeFields(varz, true)
 	return varz
 }
 
@@ -1220,11 +1197,9 @@ func (s *Server) updateVarzConfigReloadableFields(v *Varz) {
 // runtime and that should be updated any time Varz() or polling of /varz
 // is done.
 // Server lock is held on entry.
-func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64, rss int64) {
+func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool) {
 	v.Now = time.Now()
 	v.Uptime = myUptime(time.Since(s.start))
-	v.Mem = rss
-	v.CPU = pcpu
 	/*
 		if l := len(s.info.ClientConnectURLs); l > 0 {
 			v.ClientConnectURLs = append([]string(nil), s.info.ClientConnectURLs...)
@@ -1291,12 +1266,6 @@ func (s *Server) updateVarzRuntimeFields(v *Varz, forceUpdate bool, pcpu float64
 
 // HandleVarz will process HTTP requests for server information.
 func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
-	var rss, vss int64
-	var pcpu float64
-
-	// We want to do that outside of the lock.
-	pse.ProcUsage(&pcpu, &rss, &vss)
-
 	// In response to http requests, we want to minimize mem copies
 	// so we use an object stored in the server. Creating/collecting
 	// server metrics is done under server lock, but we don't want
@@ -1310,9 +1279,9 @@ func (s *Server) HandleVarz(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.httpReqStats[VarzPath]++
 	if s.varz == nil {
-		s.varz = s.createVarz(pcpu, rss)
+		s.varz = s.createVarz()
 	} else {
-		s.updateVarzRuntimeFields(s.varz, false, pcpu, rss)
+		s.updateVarzRuntimeFields(s.varz, false)
 	}
 	s.mu.Unlock()
 

@@ -26,8 +26,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/nats-io/nats-server/v2/server/pse"
 )
 
 const (
@@ -159,9 +157,6 @@ type ClientInfo struct {
 // ServerStats hold various statistics that we will periodically send out.
 type ServerStats struct {
 	Start            time.Time      `json:"start"`
-	Mem              int64          `json:"mem"`
-	Cores            int            `json:"cores"`
-	CPU              float64        `json:"cpu"`
 	Connections      int            `json:"connections"`
 	TotalConnections uint64         `json:"total_connections"`
 	ActiveAccounts   int            `json:"active_accounts"`
@@ -428,16 +423,6 @@ func (s *Server) checkRemoteServers() {
 	}
 }
 
-// Grab RSS and PCPU
-func updateServerUsage(v *ServerStats) {
-	var rss, vss int64
-	var pcpu float64
-	pse.ProcUsage(&pcpu, &rss, &vss)
-	v.Mem = rss
-	v.CPU = pcpu
-	v.Cores = numCores
-}
-
 // Generate a route stat for our statz update.
 func routeStat(r *client) *RouteStat {
 	if r == nil {
@@ -467,7 +452,6 @@ func routeStat(r *client) *RouteStat {
 // Lock should be held.
 func (s *Server) sendStatsz(subj string) {
 	m := ServerStatsMsg{}
-	updateServerUsage(&m.Stats)
 	m.Stats.Start = s.start
 	m.Stats.Connections = len(s.clients)
 	m.Stats.TotalConnections = s.totalClients
